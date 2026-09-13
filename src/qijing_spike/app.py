@@ -37,7 +37,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--probe-overlay-exclusion",
         action="store_true",
-        help="Run hide/show/hide contamination probe inside the game viewport.",
+        help="Run positive-control contamination probe inside the game viewport.",
     )
     parser.add_argument(
         "--viewport-aspect",
@@ -45,7 +45,6 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional expected game viewport aspect ratio (for example 1.7777778).",
     )
-    parser.add_argument("--expected-change", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--output-root", type=Path, default=Path("artifacts"))
     return parser
 
@@ -74,7 +73,7 @@ def _run_loop(args, overlay=None, qt_app=None) -> dict:
     health_rows: list[dict] = []
     viewport_rows: list[dict] = []
     registration_rows: list[dict] = []
-    none_grab_events: list[dict] = []
+    no_new_present_events: list[dict] = []
     capture_errors: list[dict] = []
     capture_gaps: list[dict] = []
     hwnd_events: list[dict] = []
@@ -87,6 +86,10 @@ def _run_loop(args, overlay=None, qt_app=None) -> dict:
 
     if overlay is not None:
         overlay.set_text("棋镜 Spike\nS-1/S0/S1/S2")
+        if args.probe_overlay_exclusion:
+            # The first normal capture becomes a known-clean baseline frame.
+            overlay.hide()
+            qt_app.processEvents()
 
     try:
         while time.monotonic() < deadline:
@@ -110,10 +113,10 @@ def _run_loop(args, overlay=None, qt_app=None) -> dict:
                 )
 
             if window.minimized or window.monitor is None:
-                none_grab_events.append(
+                capture_errors.append(
                     {
                         "timestamp_ns": time.perf_counter_ns(),
-                        "reason": "window minimized or monitor unresolved",
+                        "error": "window minimized or monitor unresolved",
                     }
                 )
                 continue
@@ -126,8 +129,13 @@ def _run_loop(args, overlay=None, qt_app=None) -> dict:
                 )
                 continue
             if frame is None:
-                none_grab_events.append(
-                    {"timestamp_ns": time.perf_counter_ns(), "reason": "backend returned None"}
+                # DXcam's one-shot semantics: None means no newly presented desktop
+                # frame, not a capture failure.
+                no_new_present_events.append(
+                    {
+                        "timestamp_ns": time.perf_counter_ns(),
+                        "reason": "DXGI/DXcam reported no new desktop present",
+                    }
                 )
                 continue
 
@@ -138,6 +146,7 @@ def _run_loop(args, overlay=None, qt_app=None) -> dict:
                         {
                             "timestamp_ns": frame.capture_timestamp_ns,
                             "gap_seconds": gap_seconds,
+                            "note": "informational new-present gap; not a failure without activity expectation",
                         }
                     )
             last_capture_timestamp_ns = frame.capture_timestamp_ns
@@ -150,6 +159,7 @@ def _run_loop(args, overlay=None, qt_app=None) -> dict:
                     "timestamp_ns": frame.capture_timestamp_ns,
                     "monitor_index": frame.monitor_index,
                     "clipped": frame.clipped,
+                    "reused_cached": frame.reused_cached,
                     **health.to_dict(),
                 }
             )
@@ -188,8 +198,15 @@ def _run_loop(args, overlay=None, qt_app=None) -> dict:
                         overlay=overlay,
                         qt_app=qt_app,
                         viewport_screen=viewport_screen,
+                        baseline_frame=frame,
                     )
                     overlay_probe_done = True
+                    # Probe sleeps/toggles the compositor by design. Do not charge
+                    # its wall time to S0 gap metrics or carry its visual state into
+                    # the main freshness baseline.
+                    last_capture_timestamp_ns = None
+                    health_monitor.reset()
+                    next_tick = time.monotonic() + interval
 
                 anchor_key = (
                     window.client_rect,
@@ -219,7 +236,8 @@ def _run_loop(args, overlay=None, qt_app=None) -> dict:
 
     s0 = assess_s0(
         health_rows=health_rows,
-        none_grabs=len(none_grab_events),
+        no_new_presents=len(no_new_present_events),
+        capture_errors=len(capture_errors),
         gap_count=len(capture_gaps),
     )
     s1 = assess_s1(
@@ -236,14 +254,15 @@ def _run_loop(args, overlay=None, qt_app=None) -> dict:
         "capture_backend": backend.describe(),
         "duration_seconds": args.duration,
         "target_fps": args.fps,
-        "captured_frames": len(health_rows),
-        "none_grabs": len(none_grab_events),
+        "captured_new_present_frames": len(health_rows),
+        "no_new_present_count": len(no_new_present_events),
         "capture_errors": capture_errors,
         "capture_gap_count": len(capture_gaps),
         "overlay": {
             "enabled": overlay is not None,
             "inside": bool(args.overlay_inside or args.probe_overlay_exclusion),
             "capture_exclusion": getattr(overlay, "capture_exclusion_result", None),
+            "capture_affinity_history": getattr(overlay, "capture_affinity_history", None),
             "click_through": getattr(overlay, "click_through_result", None),
             "probe": overlay_probe_result,
         },
@@ -256,7 +275,7 @@ def _run_loop(args, overlay=None, qt_app=None) -> dict:
         "health.json": health_rows,
         "viewport.json": viewport_rows,
         "registration.json": registration_rows,
-        "none_grabs.json": none_grab_events,
+        "no_new_presents.json": no_new_present_events,
         "capture_gaps.json": capture_gaps,
         "evidence.json": evidence,
     }
