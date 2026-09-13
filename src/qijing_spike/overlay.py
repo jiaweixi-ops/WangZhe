@@ -22,6 +22,16 @@ HWND_TOPMOST = -1
 SWP_NOSIZE = 0x0001
 SWP_NOACTIVATE = 0x0010
 
+# S1 probe-only signature. The product marker can use normal styling later, but
+# the measurement marker must be deliberately easy to identify and hard for
+# ordinary game motion to imitate. The probe uses a magenta square border plus
+# a cyan crosshair, both fully opaque.
+PROBE_MARKER_BORDER_RGB = (255, 0, 255)
+PROBE_MARKER_CROSS_RGB = (0, 255, 255)
+PROBE_MARKER_INSET = 5
+PROBE_MARKER_LINE_WIDTH = 4
+PROBE_MARKER_CROSS_HALF = 12
+
 
 def set_capture_affinity(hwnd: int, affinity: int) -> dict:
     if sys.platform != "win32":
@@ -174,19 +184,30 @@ if sys.platform == "win32":
             painter.setRenderHint(QtGui.QPainter.Antialiasing)
 
             if self._probe_marker_mode:
-                # Product-like small in-game marker: transparent center, bright
-                # border/crosshair. This avoids certifying a geometry the product
-                # would never draw (the old 260x120 opaque panel).
-                pen = QtGui.QPen(QtGui.QColor(40, 235, 145, 240))
-                pen.setWidth(4)
-                painter.setPen(pen)
+                # The S1 probe is an instrument, not a visual-design preview.
+                # Use a deterministic opaque two-colour signature so the probe
+                # can ask "is this marker present?" instead of inferring it from
+                # generic game-pixel differences.
+                painter.setRenderHint(QtGui.QPainter.Antialiasing, False)
+                border_pen = QtGui.QPen(QtGui.QColor(*PROBE_MARKER_BORDER_RGB, 255))
+                border_pen.setWidth(PROBE_MARKER_LINE_WIDTH)
+                painter.setPen(border_pen)
                 painter.setBrush(QtCore.Qt.NoBrush)
-                box = self.rect().adjusted(5, 5, -5, -5)
-                painter.drawRoundedRect(box, 8, 8)
+                box = self.rect().adjusted(
+                    PROBE_MARKER_INSET,
+                    PROBE_MARKER_INSET,
+                    -PROBE_MARKER_INSET - 1,
+                    -PROBE_MARKER_INSET - 1,
+                )
+                painter.drawRect(box)
+
+                cross_pen = QtGui.QPen(QtGui.QColor(*PROBE_MARKER_CROSS_RGB, 255))
+                cross_pen.setWidth(PROBE_MARKER_LINE_WIDTH)
+                painter.setPen(cross_pen)
                 cx = self.rect().center().x()
                 cy = self.rect().center().y()
-                painter.drawLine(cx - 12, cy, cx + 12, cy)
-                painter.drawLine(cx, cy - 12, cx, cy + 12)
+                painter.drawLine(cx - PROBE_MARKER_CROSS_HALF, cy, cx + PROBE_MARKER_CROSS_HALF, cy)
+                painter.drawLine(cx, cy - PROBE_MARKER_CROSS_HALF, cx, cy + PROBE_MARKER_CROSS_HALF)
                 return
 
             painter.setBrush(QtGui.QColor(22, 26, 34, 225))
