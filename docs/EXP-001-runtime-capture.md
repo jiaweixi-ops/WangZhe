@@ -27,14 +27,62 @@ None         -> NO_NEW_PRESENT
 
 `NO_NEW_PRESENT` 表示自上次采集后没有新的桌面呈现，不等于 capture error。
 
+窗口暂时不可采集也单独分类：
+
+```text
+WINDOW_UNAVAILABLE
+```
+
+典型原因：
+
+- 窗口最小化
+- 当前无法解析 monitor
+
+它不计入 `capture_error_rate`，但必须单独记录时间戳和次数，便于解释 Alt-Tab / 最小化测试。
+
 真正的 capture error 包括：
 
 - backend 抛异常
 - monitor/output 几何无法对应
-- window/monitor 无法解析
-- 其它明确失败
+- 其它明确 capture backend 失败
 
 如果实验显式复用上一帧，必须在 `CapturedFrame.reused_cached` 中保留 provenance。缓存帧不能作为 S1/S2 这类“证明新观察”的测量样本。
+
+## stale / freeze 指标
+
+局部像素长期不变化本身不能证明 capture stale。
+
+当前 S0 主循环还没有 S3/S4 提供的阶段/倒计时 liveness witness，因此冻结指标必须写成：
+
+```text
+stale_rate = null
+stale_metric_status = NO_WITNESS_DEFERRED_TO_S3_S4
+```
+
+不得写成 `0.0`。
+
+只有未来独立 witness 显式给出：
+
+```text
+activity_expected = True
+```
+
+时，`STALE_SUSPECT` 才成为可测指标。
+
+因此在 S3/S4 接入前，S0 不因“零 stale”获得完整 PASS；健康 capture path 可以得到 `DEGRADED_SHIPPABLE`，并明确注明 stale/freeze 尚未被测量。
+
+## new-present 样本充分性
+
+样本门槛必须随实验时长缩放，不使用“总共 5 帧即可”这种固定计数。
+
+证据记录：
+
+```text
+new_present_frames_per_minute
+sample_sufficiency
+```
+
+这是**测量充分性指标**，不是“游戏必须持续变化”的业务规则。
 
 ## 有效新呈现帧
 
@@ -45,12 +93,11 @@ None         -> NO_NEW_PRESENT
 - `reused_cached == False`
 - 捕获区域与当前窗口/监视器一致
 
-局部像素长期不变化本身不能证明 capture stale。只有独立 liveness witness 明确说明该区域此刻应变化时，才允许升级为 `STALE_SUSPECT`。
-
 以下都要落时间戳/计数：
 
 - NEW_PRESENT
 - NO_NEW_PRESENT
+- WINDOW_UNAVAILABLE
 - capture error
 - new-present gap（信息性）
 - black frame
