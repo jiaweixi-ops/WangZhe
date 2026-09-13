@@ -15,7 +15,7 @@ class CaptureBackend(ABC):
     name: str
 
     @abstractmethod
-    def grab(self, region: Rect, monitor: MonitorInfo | None = None) -> CapturedFrame | None:
+    def grab(self, region: Rect, monitor: MonitorInfo | None = None, *, allow_cached: bool = False) -> CapturedFrame | None:
         raise NotImplementedError
 
     def describe(self) -> dict:
@@ -50,6 +50,7 @@ class DxcamBackend(CaptureBackend):
         self._cameras: dict[tuple[int, int], object] = {}
         self._output_catalog = self._parse_output_info(dxcam.output_info())
         self._last_route: dict | None = None
+        self._last_full_by_route: dict[tuple[int, int], np.ndarray] = {}
 
     @classmethod
     def _parse_output_info(cls, text: str) -> list[dict]:
@@ -97,7 +98,7 @@ class DxcamBackend(CaptureBackend):
         }
         return camera
 
-    def grab(self, region: Rect, monitor: MonitorInfo | None = None) -> CapturedFrame | None:
+    def grab(self, region: Rect, monitor: MonitorInfo | None = None, *, allow_cached: bool = False) -> CapturedFrame | None:
         if monitor is None:
             raise RuntimeError("DXcam monitor-aware capture requires MonitorInfo")
 
@@ -107,8 +108,15 @@ class DxcamBackend(CaptureBackend):
 
         camera = self._camera_for_monitor(monitor)
         full = camera.grab()
+        route = self._route_for_monitor(monitor)
         if full is None:
-            return None
+            if not allow_cached:
+                return None
+            full = self._last_full_by_route.get(route)
+            if full is None:
+                return None
+        else:
+            self._last_full_by_route[route] = np.ascontiguousarray(full)
 
         expected_hw = (monitor.rect.height, monitor.rect.width)
         if tuple(full.shape[:2]) != expected_hw:
@@ -155,3 +163,4 @@ class DxcamBackend(CaptureBackend):
             except Exception:
                 pass
         self._cameras.clear()
+        self._last_full_by_route.clear()
