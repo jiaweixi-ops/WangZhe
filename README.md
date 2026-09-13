@@ -11,9 +11,9 @@
 - S0：区分 `NO_NEW_PRESENT`、`WINDOW_UNAVAILABLE` 与真正 capture error
 - S0：没有独立 liveness witness 时，stale KPI 显式为 `null`，不会伪报 0
 - S1：透明 Overlay、点击穿透、`WDA_EXCLUDEFROMCAPTURE`
-- S1：`--probe-overlay-exclusion` 正对照 + 同尺寸空间对照块污染实验
-- S1：探针使用 72×72 小型标记，而不是 260×120 产品外面板
-- S1：最终判词依据 affinity 开/关造成的 marker-signal **差分**，排除后绝对残留仅作诊断
+- S1：`--probe-overlay-exclusion` 使用**已知 marker 签名**做正对照与排除验证
+- S1：探针是 72×72 小型标记，签名为**品红边框 + 青色十字**
+- S1：通用画面差分只作诊断，不再参与 PASS/FAIL 判词
 - S2：真实游戏 viewport（黑边/letterbox + 可选宽高比先验）检测
 - S2：ORB + RANSAC **全仿射**参考坐标注册，安全时才允许 SCALE_ONLY 降级
 - S0/S1/S2 三值门禁：`PASS / DEGRADED_SHIPPABLE / FAIL`
@@ -116,7 +116,7 @@ Freshness 会记录局部活动与静止，但当前主循环还没有 S3/S4 提
 
 ### new-present 样本量按时间归一化
 
-S0 不再用“总共至少 5 帧”这种与实验时长无关的门槛。证据里记录：
+证据里记录：
 
 ```text
 new_present_frames_per_minute
@@ -133,53 +133,54 @@ sample_sufficiency
 qijing-spike --title 王者 --duration 30 --probe-overlay-exclusion
 ```
 
-探针使用更接近产品真实形态的 **72×72 透明小标记**，并用目标区域附近的同尺寸控制块消除普通游戏运动。
+S1 不再根据“marker 区域比 baseline 变了多少”来猜 Overlay 是否存在。Probe 会绘制一套程序自己完全知道的签名：
+
+```text
+72×72 小标记
+不透明饱和品红边框
++
+不透明青色十字
+```
 
 流程：
 
 ```text
-F0：Overlay 隐藏，取得非缓存 baseline
+F0：隐藏 Overlay，取得非缓存 baseline
  ↓
-WDA_NONE + viewport 内显示小标记
+WDA_NONE + viewport 内显示签名 marker
  ↓
 F+：取得新的桌面帧
  ↓
-计算正对照 marker-specific signal
+直接检测品红边框 + 青色十字的几何覆盖率
+ ↓
+正对照必须确认 marker 确实可见
  ↓
 WDA_EXCLUDEFROMCAPTURE
  ↓
 F−：取得新的桌面帧
  ↓
-计算 exclusion 后 marker-specific signal
- ↓
-比较 F+ → F− 的 signal reduction
+再次检测同一个 marker 签名
 ```
 
-S1 是一个 affinity **干预实验**。因此最终结论只依赖“开/关 exclusion 后 marker-specific signal 是否发生足够下降”。
+判词基于**marker 自身是否存在**：
 
-这意味着：
+- `F+` 能稳定看到签名，`F−` 签名消失 → `PROVEN_WORKING / PASS`
+- `F+` 能看到签名，`F−` 仍保留大部分签名 → `PROVEN_NOT_WORKING / DEGRADED_SHIPPABLE`
+- 签名只部分残留、证据处于模糊区 → `UNMEASURED / DEGRADED_SHIPPABLE`
+
+通用 diff 指标（例如 `excluded_signal_mean`、`signal_reduction_mean`、控制块 motion）仍保存到 evidence 中，但**只用于诊断游戏运动，不拥有判决权**。
+
+因此：
 
 ```text
-F− 里游戏自己仍在 marker 区运动
+F+ 时游戏运动很强
+F− 时游戏运动变弱
+但 marker 在 F− 仍然可见
 ```
 
-不会因为绝对残留大就被错误标成 `PROVEN_NOT_WORKING`。`excluded_signal_mean/p95` 仍保存到证据包里，但只用于诊断。
+也不能再因为 generic diff reduction 很大而误签 `PROVEN_WORKING`。
 
-S1 额外输出：
-
-```text
-exclusion_outcome:
-  PROVEN_WORKING
-  PROVEN_NOT_WORKING
-  UNMEASURED
-```
-
-其中 `PROVEN_NOT_WORKING` 只允许在：
-
-- affinity API 明确失败；或
-- 正对照成立后，开启 exclusion 没有产生足够 signal reduction。
-
-任一测量帧来自缓存、拿不到新帧、没有同尺寸控制块或正对照无法隔离 marker-specific signal，都不能 PASS。
+任一测量帧来自缓存、拿不到新帧、marker 被裁剪、正对照检测不到签名、affinity API 失败或签名证据落在模糊区，都不能 PASS。
 
 如果游戏内 Overlay 无法证明干净，但外置面板可用，S1 为 `DEGRADED_SHIPPABLE`。
 
@@ -234,11 +235,11 @@ pytest
 - 无 witness 时 stale KPI 为 `null`
 - new-present 样本密度随实验时长缩放
 - `WINDOW_UNAVAILABLE` 不作为 capture error
-- S1 正对照通过后排除成功
-- 活动游戏画面经过同尺寸控制块归一化后仍可正确 PASS
-- **marker 区局部运动存在时，排除成功仍依据差分正确 PASS**
-- **marker 区局部运动 + 排除失败时仍正确 `PROVEN_NOT_WORKING`**
-- S1 排除失败产生 `PROVEN_NOT_WORKING`
+- S1 正对照必须真的检测到 marker 签名
+- marker 区局部运动存在时，排除成功仍可 PASS
+- **F+ 运动强 / F− 运动弱但 marker 仍在时，不得假认证 PASS**
+- marker 保留时输出 `PROVEN_NOT_WORKING`
+- 部分残留的模糊签名不能被强行认证
 - 缓存帧不能产生 S1 假 PASS
 - 正对照不可见时产生 `UNMEASURED`
 - DXGI `NO_NEW_PRESENT` 不作为 capture error
