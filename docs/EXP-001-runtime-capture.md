@@ -16,16 +16,45 @@
 - 睡眠/唤醒 ×3
 - HDR 开/关（设备支持时）
 
-## 有效帧
+## 捕获观测语义
+
+DXcam one-shot `grab()` 的两种正常结果必须分开记：
+
+```text
+numpy frame  -> NEW_PRESENT
+None         -> NO_NEW_PRESENT
+```
+
+`NO_NEW_PRESENT` 表示自上次采集后没有新的桌面呈现，不等于 capture error。
+
+真正的 capture error 包括：
+
+- backend 抛异常
+- monitor/output 几何无法对应
+- window/monitor 无法解析
+- 其它明确失败
+
+如果实验显式复用上一帧，必须在 `CapturedFrame.reused_cached` 中保留 provenance。缓存帧不能作为 S1/S2 这类“证明新观察”的测量样本。
+
+## 有效新呈现帧
 
 同时满足：
 
 - 非黑
 - 新鲜时间戳/单调 sequence
-- 不是长期陈旧重复内容
+- `reused_cached == False`
 - 捕获区域与当前窗口/监视器一致
 
-`None` 抓帧、capture gap、黑帧、stale suspect 都要落时间戳，不只计数。
+局部像素长期不变化本身不能证明 capture stale。只有独立 liveness witness 明确说明该区域此刻应变化时，才允许升级为 `STALE_SUSPECT`。
+
+以下都要落时间戳/计数：
+
+- NEW_PRESENT
+- NO_NEW_PRESENT
+- capture error
+- new-present gap（信息性）
+- black frame
+- stale suspect（仅在有 activity witness 时）
 
 ## 多显示器
 
