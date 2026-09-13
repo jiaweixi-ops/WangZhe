@@ -40,11 +40,13 @@ def probe_overlay_exclusion(
 
     F0 and F2 estimate background motion. F1 is captured with the overlay visible.
     A clean exclusion should make F1 no more different than the hidden baseline.
+    Cached capture is allowed here so a truly static game frame does not make an
+    otherwise successful capture-exclusion test inconclusive.
     """
     overlay.hide()
     qt_app.processEvents()
     time.sleep(settle_seconds)
-    f0 = backend.grab(window.client_rect, window.monitor)
+    f0 = backend.grab(window.client_rect, window.monitor, allow_cached=True)
     if f0 is None:
         return {"conclusive": False, "reason": "no hidden baseline frame F0"}
 
@@ -55,7 +57,7 @@ def probe_overlay_exclusion(
     time.sleep(settle_seconds)
     overlay_rect = overlay.physical_rect()
     overlap = overlay_rect.intersect(window.client_rect).intersect(viewport_screen)
-    f1 = backend.grab(window.client_rect, window.monitor)
+    f1 = backend.grab(window.client_rect, window.monitor, allow_cached=True)
     if f1 is None or overlap.area <= 0:
         return {
             "conclusive": False,
@@ -67,7 +69,7 @@ def probe_overlay_exclusion(
     overlay.hide()
     qt_app.processEvents()
     time.sleep(settle_seconds)
-    f2 = backend.grab(window.client_rect, window.monitor)
+    f2 = backend.grab(window.client_rect, window.monitor, allow_cached=True)
     if f2 is None:
         return {"conclusive": False, "reason": "no hidden baseline frame F2"}
 
