@@ -9,31 +9,20 @@
 - S0：监视器感知、多显示器路由、窗口越界裁剪
 - S0：ROI/网格级局部变化、新鲜帧、黑帧检查
 - S0：区分 `NO_NEW_PRESENT`、`WINDOW_UNAVAILABLE` 与真正 capture error
-- S0：没有独立 liveness witness 时，stale KPI 显式为 `null`，不会伪报 0
+- S0：没有独立 liveness witness 时，stale KPI 显式为 `null`
+- S0：S4 timer witness 激活后，连续 `NO_NEW_PRESENT` 也可以成为冻结证据
 - S1：透明 Overlay、点击穿透、`WDA_EXCLUDEFROMCAPTURE`
-- S1：`--probe-overlay-exclusion` 使用**已知 marker 签名**做正对照与排除验证
-- S1：探针是 72×72 小型标记，签名为**品红边框 + 青色十字**
-- S1：通用画面差分只作诊断，不再参与 PASS/FAIL 判词
-- S2：真实游戏 viewport（黑边/letterbox + 可选宽高比先验）检测
-- S2：ORB + RANSAC **全仿射**参考坐标注册，安全时才允许 SCALE_ONLY 降级
-- S0/S1/S2 三值门禁：`PASS / DEGRADED_SHIPPABLE / FAIL`
-- 完整证据 JSON（环境、present witness、全部 registration 样本与聚合）
-- Linux + Windows CI 单元/导入测试
+- S1：签名式 probe（品红边框 + 青色十字），generic diff 只作诊断
+- S2：真实游戏 viewport 检测
+- S2：ORB + RANSAC 全仿射参考坐标注册
+- S3：版本化模板信号 → `PREPARATION / COMBAT / UNKNOWN`
+- S3：防抖状态机，不允许一帧切阶段
+- S4：数字模板 OCR + 可选弧形进度双通道
+- S4：timer temporal validation + preparation liveness witness
+- S0~S4 证据与门禁
+- Linux + Windows CI
 
-**尚未实现**：S3 阶段识别、S4 倒计时、S5 时间冻结假计划，以及 Product 层的英雄 OCR、GameState、策略评分、数据库、LLM、自动点击/拖拽。
-
-## 当前 Spike 继续条件
-
-在 S3/S4 尚未提供 liveness witness 前，S0 的完整 `PASS` 本来就不可达。因此当前阶段允许继续到 S3/S4 的条件是：
-
-```text
-S0 = DEGRADED_SHIPPABLE
-且唯一未闭合项是 stale/freeze 无 witness
-且 capture / black / sample-density 没有 FAIL
-且 S1 / S2 没有 FAIL
-```
-
-也就是说，**不会为了等一个构造上不可达的 S0 PASS 而阻塞 S3/S4**；等阶段识别和倒计时 witness 接入后，再重新签发 S0 的完整 PASS/FAIL。
+**尚未实现**：S5 时间冻结假计划，以及 Product 层的英雄 OCR、GameState、策略评分、数据库、LLM、自动点击/拖拽。
 
 ## 环境
 
@@ -50,7 +39,7 @@ python -m pip install -U pip
 pip install -e ".[dev]"
 ```
 
-## 1. 先做 S−1：检查运行形态
+## 1. S−1：检查运行形态
 
 ```powershell
 qijing-inspect --title 王者
@@ -58,9 +47,9 @@ qijing-inspect --title 王者
 
 输出 HWND / PID / EXE / Window Class、物理像素客户区、进程父子树、监视器信息与运行形态候选。
 
-> `UNKNOWN` 是允许结果；不要为了“有答案”强猜原生 PC。
+`UNKNOWN` 是允许结果；不要为了“有答案”强猜原生 PC。
 
-## 2. 跑 S0 基础捕获
+## 2. S0 基础捕获
 
 ```powershell
 qijing-spike --title 王者 --duration 60
@@ -76,34 +65,21 @@ artifacts/spike-YYYYMMDD-HHMMSS/
 ├─ health.json
 ├─ viewport.json
 ├─ registration.json
+├─ phase.json
+├─ timer.json
+├─ liveness.json
 ├─ no_new_presents.json
 ├─ window_unavailable.json
 └─ capture_gaps.json
 ```
 
-### DXGI / DXcam 语义
+DXcam one-shot `grab()` 没有新呈现时可能返回 `None`，本项目把它记录为 `NO_NEW_PRESENT`，不是 capture error。
 
-DXcam 的 one-shot `grab()` 在没有新的桌面呈现时可以返回 `None`。本 Spike 将它记录成：
+窗口最小化或 monitor 暂不可解析记录为 `WINDOW_UNAVAILABLE`，与 backend 异常分开。
 
-```text
-NO_NEW_PRESENT
-```
+### S0 stale 语义
 
-而不是 capture failure。
-
-窗口最小化或暂时无法解析监视器时记录：
-
-```text
-WINDOW_UNAVAILABLE
-```
-
-它与 backend 异常分开计，不进入 `capture_error_rate`。
-
-如果实验显式允许复用上一帧，`CapturedFrame.reused_cached=True` 会保留该 provenance。**缓存帧不得用于证明 S1 排除成功。**
-
-### stale / freeze 目前是“不可测”，不是“0”
-
-Freshness 会记录局部活动与静止，但当前主循环还没有 S3/S4 提供的独立 activity witness。因此：
+不带 S3/S4 profile 时：
 
 ```json
 {
@@ -112,146 +88,189 @@ Freshness 会记录局部活动与静止，但当前主循环还没有 S3/S4 提
 }
 ```
 
-这是有意设计：没有仪器时不允许把“0 次 stale”解释成“没有冻结”。在 S3/S4 接入阶段/倒计时 liveness witness 前，S0 最多只能得到 `DEGRADED_SHIPPABLE`，不能因为 stale=0 获得完整 PASS。
+启用可信 preparation timer witness 后：
 
-### new-present 样本量按时间归一化
+- 有新帧但超过 stale 时间没有有意义变化 → `STALE_SUSPECT`
+- timer 明确应继续走，但 DXGI 持续没有新 present → `liveness.json` 记录 `stale_suspect=true`
 
-证据里记录：
+没有 witness 时永远不能把 stale=0 当“没有冻结”。
 
-```text
-new_present_frames_per_minute
-sample_sufficiency
-```
-
-用于判断本次 Spike 是否拿到了足够测量样本；该指标是**测量充分性**，不是“游戏必须一直动”的产品规则。
-
-## 3. 真正验证 S1 Overlay 污染
-
-运行：
+## 3. S1 Overlay 排除
 
 ```powershell
 qijing-spike --title 王者 --duration 30 --probe-overlay-exclusion
 ```
 
-S1 不再根据“marker 区域比 baseline 变了多少”来猜 Overlay 是否存在。Probe 会绘制一套程序自己完全知道的签名：
+Probe 绘制程序完全知道的 72×72 签名：
 
 ```text
-72×72 小标记
-不透明饱和品红边框
-+
-不透明青色十字
+不透明饱和品红边框 + 不透明青色十字
 ```
 
-流程：
+判词只看 marker 自身签名：
 
-```text
-F0：隐藏 Overlay，取得非缓存 baseline
- ↓
-WDA_NONE + viewport 内显示签名 marker
- ↓
-F+：取得新的桌面帧
- ↓
-直接检测品红边框 + 青色十字的几何覆盖率
- ↓
-正对照必须确认 marker 确实可见
- ↓
-WDA_EXCLUDEFROMCAPTURE
- ↓
-F−：取得新的桌面帧
- ↓
-再次检测同一个 marker 签名
-```
+- `WDA_NONE` 能看到，`WDA_EXCLUDEFROMCAPTURE` 后消失 → `PROVEN_WORKING / PASS`
+- 排除后仍保留大部分 marker → `PROVEN_NOT_WORKING / DEGRADED_SHIPPABLE`
+- 模糊残留 / 缓存帧 / 无新帧 / 正对照不可见 → `UNMEASURED`
 
-判词基于**marker 自身是否存在**：
+游戏运动差分仍写入 evidence，但没有 S1 判决权。
 
-- `F+` 能稳定看到签名，`F−` 签名消失 → `PROVEN_WORKING / PASS`
-- `F+` 能看到签名，`F−` 仍保留大部分签名 → `PROVEN_NOT_WORKING / DEGRADED_SHIPPABLE`
-- 签名只部分残留、证据处于模糊区 → `UNMEASURED / DEGRADED_SHIPPABLE`
+## 4. S2 参考坐标注册
 
-通用 diff 指标（例如 `excluded_signal_mean`、`signal_reduction_mean`、控制块 motion）仍保存到 evidence 中，但**只用于诊断游戏运动，不拥有判决权**。
-
-因此：
-
-```text
-F+ 时游戏运动很强
-F− 时游戏运动变弱
-但 marker 在 F− 仍然可见
-```
-
-也不能再因为 generic diff reduction 很大而误签 `PROVEN_WORKING`。
-
-任一测量帧来自缓存、拿不到新帧、marker 被裁剪、正对照检测不到签名、affinity API 失败或签名证据落在模糊区，都不能 PASS。
-
-如果游戏内 Overlay 无法证明干净，但外置面板可用，S1 为 `DEGRADED_SHIPPABLE`。
-
-探针运行时间从 S0 的 sample-density 观察时长中扣除，并重置 gap/freshness 基线，不污染 S0。
-
-## 4. 参考坐标注册
-
-先保存基准图：
+保存基准：
 
 ```powershell
 qijing-spike --title 王者 --duration 5 --save-reference reference.jpg
 ```
 
-再验证缩放/拖边：
+验证拖动/缩放：
 
 ```powershell
 qijing-spike --title 王者 --duration 30 --reference reference.jpg
 ```
 
-注册使用 ORB + `estimateAffine2D`，支持非等比 X/Y 缩放。证据同时记录：
+注册使用 ORB + `estimateAffine2D`，支持 X/Y 非等比缩放；不安全时明确 FAILED，而不是安静返回错误矩阵。
 
-- inlier 数/比例
-- inlier 残差
-- **全部 good matches** 的均值/P90 残差
-- X/Y 尺度
-- 几何一致性后的 confidence
-- `ORB_AFFINE / SCALE_ONLY / FAILED`
+## 5. S3/S4 Stage Profile
 
-`SCALE_ONLY` 只有在参考图与当前 viewport 宽高比近似一致时才允许；宽高比明显变化时会明确 `FAILED`，不会安静返回错误矩阵。
+S3/S4 不把游戏 UI 硬编码进 Python。必须提供版本化 JSON profile：
 
-## 5. 模拟器/串流 viewport
+```powershell
+qijing-spike --title 王者 --duration 30 --stage-profile profiles/wangzhe-current.json
+```
 
-若已经知道游戏内部视口是 16:9，可临时提供先验：
+Profile 中定义：
+
+- PREPARATION 模板信号 + ROI
+- COMBAT 模板信号 + ROI
+- timer ROI
+- 可选 `0.png ... 9.png` 数字模板
+- 可选弧形进度 HSV/几何参数
+
+所有 ROI 都相对**真实游戏 viewport**，不是客户区。
+
+完整 schema 和协议见：
+
+```text
+docs/EXP-003-phase-timer.md
+```
+
+## 6. S3 受控验收
+
+完整 S3 PASS 必须带 ground truth，分两个受控片段跑：
+
+```powershell
+qijing-spike --title 王者 --duration 30 `
+  --stage-profile profiles/wangzhe-current.json `
+  --s3-ground-truth PREPARATION
+```
+
+以及：
+
+```powershell
+qijing-spike --title 王者 --duration 30 `
+  --stage-profile profiles/wangzhe-current.json `
+  --s3-ground-truth COMBAT
+```
+
+`--s3-ground-truth` **只用于评分**，不会输入分类器。
+
+没有 ground truth 时，即使阶段输出看起来稳定，S3 最多 `DEGRADED_SHIPPABLE`，不能自证 PASS。
+
+## 7. S4 Timer
+
+数字通道：
+
+```text
+准备阶段 timer ROI
+→ 二值化
+→ 连通域
+→ 单字归一化
+→ 0~9 游戏内模板匹配
+```
+
+弧形通道：
+
+```text
+HSV active color + 中心/半径/环宽/方向
+→ angular sampling
+→ active fraction
+→ remaining seconds
+```
+
+两通道都有效但差异超过 profile 的 `disagreement_seconds`：
+
+```text
+source = DISAGREE
+valid = false
+```
+
+不会为了“持续有输出”强选一个。
+
+只有以下条件同时成立，S4 才能给 S0 liveness witness：
+
+```text
+stable_phase == PREPARATION
+TimerReading.valid == true
+confidence >= witness_min_confidence
+valid_streak >= witness_min_streak
+remaining_seconds > 1
+```
+
+witness 有 TTL，旧 timer 读数不会无限延长活动预期。
+
+## 8. S3/S4 证据
+
+启用 `--stage-profile` 后重点查看：
+
+```text
+phase.json
+timer.json
+liveness.json
+```
+
+以及：
+
+```text
+evidence.json -> gates.S3
+evidence.json -> gates.S4
+evidence.json -> gates.S0.metrics.stale_metric_status
+```
+
+如果 S3/S4 没有受控 ground truth，门禁会明确保守降级。
+
+## 9. 模拟器/串流 viewport
+
+若已经知道内部游戏视口宽高比，例如 16:9：
 
 ```powershell
 qijing-spike --title 王者 --duration 30 --viewport-aspect 1.7777778
 ```
 
-该路线会明确标记为低置信 `ASPECT_PRIOR`，不会冒充黑边检测成功。
+该路线会明确标成低置信 `ASPECT_PRIOR`，不会冒充黑边检测成功。
 
-## 6. 测试
+## 10. 测试
 
 ```powershell
 pytest
 ```
 
-当前测试重点覆盖：
+测试覆盖：
 
-- 小范围真实 UI 变化
-- 合法静止不因历史活动被误报 stale
-- 外部 activity witness 可触发 stale
-- 无 witness 时 stale KPI 为 `null`
-- new-present 样本密度随实验时长缩放
-- `WINDOW_UNAVAILABLE` 不作为 capture error
-- S1 正对照必须真的检测到 marker 签名
-- marker 区局部运动存在时，排除成功仍可 PASS
-- **F+ 运动强 / F− 运动弱但 marker 仍在时，不得假认证 PASS**
-- marker 保留时输出 `PROVEN_NOT_WORKING`
-- 部分残留的模糊签名不能被强行认证
-- 缓存帧不能产生 S1 假 PASS
-- 正对照不可见时产生 `UNMEASURED`
-- DXGI `NO_NEW_PRESENT` 不作为 capture error
-- viewport 显式失败/降级
-- Rect 数学
-- registration 导入与 ORB 兼容
-- 非等比缩放全仿射
-- 不安全 SCALE_ONLY 拒绝
+- freshness / black / legal static
+- S0 witness/no-witness 语义
+- S1 marker signature 正反向与运动混淆场景
+- viewport / Rect
+- ORB registration / 非等比缩放
+- S3 模板分类 / ambiguous UNKNOWN / debounce
+- S4 digit OCR / arc reader / timer witness
+- S3/S4 gate ground-truth discipline
+- no-present + active timer witness 的 stale 路径
 
-## 7. 协议
+## 11. 协议
 
 - `docs/EXP-001-runtime-capture.md`
 - `docs/EXP-002-spike-gates.md`
+- `docs/EXP-003-phase-timer.md`
 
-阈值的代码真值在 `qijing_spike.gates.SPIKE_THRESHOLDS`，协议文件解释这些阈值的含义与人工验收步骤。
+阈值的代码真值在 `qijing_spike.gates.SPIKE_THRESHOLDS`。
