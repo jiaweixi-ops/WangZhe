@@ -8,9 +8,11 @@
 - S0：DXGI Desktop Duplication 捕获（DXcam）
 - S0：监视器感知、多显示器路由、窗口越界裁剪
 - S0：ROI/网格级局部变化、新鲜帧、黑帧检查
-- S0：区分“无新桌面呈现”与真正 capture error
+- S0：区分 `NO_NEW_PRESENT`、`WINDOW_UNAVAILABLE` 与真正 capture error
+- S0：没有独立 liveness witness 时，stale KPI 显式为 `null`，不会伪报 0
 - S1：透明 Overlay、点击穿透、`WDA_EXCLUDEFROMCAPTURE`
-- S1：`--probe-overlay-exclusion` 正对照污染实验
+- S1：`--probe-overlay-exclusion` 正对照 + 同尺寸空间对照块污染实验
+- S1：探针使用 72×72 小型标记，而不是 260×120 产品外面板
 - S2：真实游戏 viewport（黑边/letterbox + 可选宽高比先验）检测
 - S2：ORB + RANSAC **全仿射**参考坐标注册，安全时才允许 SCALE_ONLY 降级
 - S0/S1/S2 三值门禁：`PASS / DEGRADED_SHIPPABLE / FAIL`
@@ -61,6 +63,7 @@ artifacts/spike-YYYYMMDD-HHMMSS/
 ├─ viewport.json
 ├─ registration.json
 ├─ no_new_presents.json
+├─ window_unavailable.json
 └─ capture_gaps.json
 ```
 
@@ -72,43 +75,92 @@ DXcam 的 one-shot `grab()` 在没有新的桌面呈现时可以返回 `None`。
 NO_NEW_PRESENT
 ```
 
-而不是 capture failure。因此合法静止画面不会因为大量 `None` 被 S0 判坏。
+而不是 capture failure。
 
-如果某个实验显式允许复用上一帧，`CapturedFrame.reused_cached=True` 会保留该 provenance。**缓存帧不得用于证明 S1 排除成功。**
+窗口最小化或暂时无法解析监视器时记录：
 
-Freshness 仍会记录局部活动和静止时长，但仅在未来 S3/S4 或其它独立 witness 明确给出 `activity_expected=True` 时，才允许升级为 `STALE_SUSPECT`。单纯“刚才动过、现在静止 3 秒”不会再被当作冻结。
+```text
+WINDOW_UNAVAILABLE
+```
+
+它与 backend 异常分开计，不进入 `capture_error_rate`。
+
+如果实验显式允许复用上一帧，`CapturedFrame.reused_cached=True` 会保留该 provenance。**缓存帧不得用于证明 S1 排除成功。**
+
+### stale / freeze 目前是“不可测”，不是“0”
+
+Freshness 会记录局部活动与静止，但当前主循环还没有 S3/S4 提供的独立 activity witness。因此：
+
+```json
+{
+  "stale_rate": null,
+  "stale_metric_status": "NO_WITNESS_DEFERRED_TO_S3_S4"
+}
+```
+
+这是有意设计：没有仪器时不允许把“0 次 stale”解释成“没有冻结”。在 S3/S4 接入阶段/倒计时 liveness witness 前，S0 最多只能得到 `DEGRADED_SHIPPABLE`，不能因为 stale=0 获得完整 PASS。
+
+### new-present 样本量按时间归一化
+
+S0 不再用“总共至少 5 帧”这种与实验时长无关的门槛。证据里记录：
+
+```text
+new_present_frames_per_minute
+sample_sufficiency
+```
+
+用于判断本次 Spike 是否拿到了足够测量样本；该指标是**测量充分性**，不是“游戏必须一直动”的产品规则。
 
 ## 3. 真正验证 S1 Overlay 污染
 
-请在相对稳定的准备画面运行：
+运行：
 
 ```powershell
 qijing-spike --title 王者 --duration 30 --probe-overlay-exclusion
 ```
 
-S1 不再用“没看到 Overlay”直接证明成功，而是先证明仪器能看到已知阳性信号：
+探针现在使用更接近产品真实形态的 **72×72 透明小标记**，并用目标区域附近的同尺寸控制块消除普通游戏运动。
+
+流程：
 
 ```text
 F0：Overlay 隐藏，取得非缓存 baseline
  ↓
-关闭排除（WDA_NONE）
+WDA_NONE + viewport 内显示小标记
  ↓
-viewport 内显示 Overlay
+F+：取得新的桌面帧
  ↓
-F+：必须取得新的桌面帧，并显著看到 Overlay        ← 正对照
+计算：目标块变化 - 邻近同尺寸控制块变化
  ↓
-重新开启 WDA_EXCLUDEFROMCAPTURE
+必须观察到 marker-specific 正对照信号
  ↓
-F−：必须取得新的桌面帧
+WDA_EXCLUDEFROMCAPTURE
  ↓
-确认 Overlay 信号显著下降并落到阈值内          ← 阴性验证
+F−：取得新的桌面帧
+ ↓
+再次做空间归一化
+ ↓
+marker-specific 信号应显著下降
 ```
 
-任一测量帧来自缓存、拿不到新的桌面帧、正对照看不到 Overlay，都会得到 **inconclusive**，S1 不允许 PASS。
+这样普通棋盘动画同时出现在目标块和控制块时，不会直接被误算成 Overlay 污染；同时正对照也不再只是证明“画面有东西在动”，而是证明**Overlay 所在局部出现了额外信号**。
 
-若客户区内排除无法被证明，但外置面板可用，S1 为 `DEGRADED_SHIPPABLE`。
+S1 额外输出：
 
-探针运行期间会重置主循环 gap/freshness 基线，不把 probe 自身的 sleep/affinity 切换计成 S0 捕获 gap。
+```text
+exclusion_outcome:
+  PROVEN_WORKING
+  PROVEN_NOT_WORKING
+  UNMEASURED
+```
+
+因此“已经证明排除失败”和“这次没测到”不会再被压成同一种语义。
+
+任一测量帧来自缓存、拿不到新帧、没有同尺寸控制块或正对照无法隔离 marker-specific 信号，都不能 PASS。
+
+如果游戏内 Overlay 无法证明干净，但外置面板可用，S1 为 `DEGRADED_SHIPPABLE`。
+
+探针运行时间从 S0 的 sample-density 观察时长中扣除，并重置 gap/freshness 基线，不污染 S0。
 
 ## 4. 参考坐标注册
 
@@ -151,15 +203,19 @@ qijing-spike --title 王者 --duration 30 --viewport-aspect 1.7777778
 pytest
 ```
 
-当前单元测试覆盖：
+当前测试重点覆盖：
 
 - 小范围真实 UI 变化
 - 合法静止不因历史活动被误报 stale
 - 外部 activity witness 可触发 stale
+- 无 witness 时 stale KPI 为 `null`
+- new-present 样本密度随实验时长缩放
+- `WINDOW_UNAVAILABLE` 不作为 capture error
 - S1 正对照通过后排除成功
-- S1 排除失败降级
-- **缓存帧不能产生 S1 假 PASS**
-- 正对照不可见时不能 PASS
+- **活动游戏画面经过同尺寸控制块归一化后仍可正确 PASS**
+- S1 排除失败产生 `PROVEN_NOT_WORKING`
+- 缓存帧不能产生 S1 假 PASS
+- 正对照不可见时产生 `UNMEASURED`
 - DXGI `NO_NEW_PRESENT` 不作为 capture error
 - viewport 显式失败/降级
 - Rect 数学

@@ -10,7 +10,9 @@ from .models import GateResult
 
 SPIKE_THRESHOLDS = {
     "s0": {
-        "pass_min_new_present_frames": 5,
+        # Measurement sufficiency, not a claim about how often a legal desktop must change.
+        "pass_min_new_present_frames_per_minute": 12.0,
+        "degraded_min_new_present_frames_per_minute": 2.0,
         "pass_max_black_rate": 0.001,
         "pass_max_stale_rate": 0.01,
         "pass_max_capture_error_rate": 0.01,
@@ -19,11 +21,11 @@ SPIKE_THRESHOLDS = {
         "degraded_max_capture_error_rate": 0.05,
     },
     "s1": {
-        "min_positive_control_signal_mean": 6.0,
-        "min_positive_control_signal_p95": 24.0,
-        "max_excluded_signal_mean": 4.0,
-        "max_excluded_signal_p95": 18.0,
-        "min_signal_reduction_mean": 4.0,
+        "min_positive_control_signal_mean": 4.0,
+        "min_positive_control_signal_p95": 18.0,
+        "max_excluded_signal_mean": 3.0,
+        "max_excluded_signal_p95": 14.0,
+        "min_signal_reduction_mean": 3.0,
     },
     "s2": {
         "pass_min_accepted_rate": 0.95,
@@ -44,55 +46,112 @@ def assess_s0(
     health_rows: list[dict],
     no_new_presents: int,
     capture_errors: int,
+    window_unavailable: int,
     gap_count: int,
+    observed_seconds: float,
 ) -> dict:
-    """Assess S0 without treating event-driven DXGI idleness as failure.
+    """Assess S0 without turning unmeasured liveness into a zero-valued KPI.
 
-    DXcam returns None when there is no newly presented desktop frame. That is
-    recorded as liveness evidence but is not a capture error. Likewise, long
-    intervals between new presents are informational until a stage-aware witness
-    says the game *should* be changing.
+    DXcam returning None means no newly presented desktop frame, not a capture
+    error. STALE_SUSPECT is only meaningful on frames where an independent
+    activity witness explicitly said activity was expected. Until S3/S4 provide
+    such a witness, stale_rate is null and S0 cannot receive a full PASS solely
+    by observing zero stale events.
     """
     captured = len(health_rows)
     poll_attempts = captured + no_new_presents
-    total_operations = poll_attempts + capture_errors
+    total_capture_operations = poll_attempts + capture_errors
     counts = Counter(row["freshness"] for row in health_rows)
+
+    witnessed_rows = [row for row in health_rows if row.get("activity_expected") is True]
+    stale_rate = (
+        _rate(
+            sum(row.get("freshness") == "STALE_SUSPECT" for row in witnessed_rows),
+            len(witnessed_rows),
+        )
+        if witnessed_rows
+        else None
+    )
+    stale_metric_status = (
+        "MEASURED_WITH_ACTIVITY_WITNESS"
+        if witnessed_rows
+        else "NO_WITNESS_DEFERRED_TO_S3_S4"
+    )
+
+    minutes = max(float(observed_seconds), 0.001) / 60.0
+    new_present_per_minute = captured / minutes
+    t = SPIKE_THRESHOLDS["s0"]
+    if new_present_per_minute >= t["pass_min_new_present_frames_per_minute"]:
+        sample_sufficiency = "PASS_SAMPLE_DENSITY"
+    elif new_present_per_minute >= t["degraded_min_new_present_frames_per_minute"]:
+        sample_sufficiency = "DEGRADED_SAMPLE_DENSITY"
+    else:
+        sample_sufficiency = "LOW_SAMPLE_DENSITY"
+
     metrics = {
         "captured_new_present_frames": captured,
+        "observed_seconds": float(observed_seconds),
+        "new_present_frames_per_minute": new_present_per_minute,
+        "sample_sufficiency": sample_sufficiency,
         "poll_attempts": poll_attempts,
         "no_new_present_count": no_new_presents,
         "no_new_present_rate": _rate(no_new_presents, poll_attempts),
+        "window_unavailable_count": window_unavailable,
         "capture_error_count": capture_errors,
-        "capture_error_rate": _rate(capture_errors, total_operations),
+        "capture_error_rate": _rate(capture_errors, total_capture_operations),
         "black_rate": _rate(counts.get("BLACK", 0), captured),
-        "stale_rate": _rate(counts.get("STALE_SUSPECT", 0), captured),
+        "stale_rate": stale_rate,
+        "stale_metric_status": stale_metric_status,
+        "activity_witnessed_frames": len(witnessed_rows),
         "new_present_gap_count": gap_count,
         "new_present_gap_rate": _rate(gap_count, max(captured - 1, 1)),
         "freshness_counts": dict(counts),
         "note": (
-            "no_new_present_rate and new_present_gap_rate are informational; "
-            "they are not failures without an independent activity expectation"
+            "no_new_present/gap/window_unavailable are separate evidence classes; "
+            "stale_rate is null until an independent activity witness exists"
         ),
     }
-    t = SPIKE_THRESHOLDS["s0"]
+
+    stale_pass = stale_rate is not None and stale_rate <= t["pass_max_stale_rate"]
+    stale_degraded_ok = stale_rate is None or stale_rate <= t["degraded_max_stale_rate"]
+    hard_health_pass = (
+        metrics["black_rate"] <= t["pass_max_black_rate"]
+        and metrics["capture_error_rate"] <= t["pass_max_capture_error_rate"]
+    )
+    degraded_health_ok = (
+        metrics["black_rate"] <= t["degraded_max_black_rate"]
+        and metrics["capture_error_rate"] <= t["degraded_max_capture_error_rate"]
+        and stale_degraded_ok
+    )
+
     if captured == 0:
         result = GateResult.FAIL
+        reason = "no new-present frame was captured"
     elif (
-        captured >= t["pass_min_new_present_frames"]
-        and metrics["black_rate"] <= t["pass_max_black_rate"]
-        and metrics["stale_rate"] <= t["pass_max_stale_rate"]
-        and metrics["capture_error_rate"] <= t["pass_max_capture_error_rate"]
+        hard_health_pass
+        and stale_pass
+        and sample_sufficiency == "PASS_SAMPLE_DENSITY"
     ):
         result = GateResult.PASS
-    elif (
-        metrics["black_rate"] <= t["degraded_max_black_rate"]
-        and metrics["stale_rate"] <= t["degraded_max_stale_rate"]
-        and metrics["capture_error_rate"] <= t["degraded_max_capture_error_rate"]
-    ):
+        reason = "capture health and witnessed liveness both met PASS thresholds"
+    elif degraded_health_ok:
         result = GateResult.DEGRADED_SHIPPABLE
+        if stale_rate is None:
+            reason = "capture path is usable, but stale/freeze detection is unmeasured until S3/S4 provide a liveness witness"
+        elif sample_sufficiency != "PASS_SAMPLE_DENSITY":
+            reason = "capture path is usable, but new-present sample density is below PASS evidence threshold"
+        else:
+            reason = "capture path is usable under degraded health thresholds"
     else:
         result = GateResult.FAIL
-    return {"result": result.value, "metrics": metrics, "thresholds": t}
+        reason = "capture health exceeded degraded thresholds"
+
+    return {
+        "result": result.value,
+        "reason": reason,
+        "metrics": metrics,
+        "thresholds": t,
+    }
 
 
 def assess_s1(probe: dict | None, *, external_overlay_available: bool) -> dict:
@@ -100,6 +159,7 @@ def assess_s1(probe: dict | None, *, external_overlay_available: bool) -> dict:
         return {
             "result": GateResult.NOT_RUN.value,
             "reason": "inside-overlay contamination probe not run",
+            "exclusion_outcome": "UNMEASURED",
             "thresholds": SPIKE_THRESHOLDS["s1"],
         }
 
@@ -121,22 +181,30 @@ def assess_s1(probe: dict | None, *, external_overlay_available: bool) -> dict:
         >= t["min_signal_reduction_mean"]
     )
     affinity_ok = bool((probe.get("capture_exclusion") or {}).get("success"))
-    exclusion_verified = bool(probe.get("exclusion_verified"))
 
-    if conclusive and positive_control and exclusion_verified and affinity_ok and excluded_clean:
+    if not conclusive or not positive_control:
+        exclusion_outcome = "UNMEASURED"
+    elif not affinity_ok:
+        exclusion_outcome = "PROVEN_NOT_WORKING"
+    elif excluded_clean:
+        exclusion_outcome = "PROVEN_WORKING"
+    else:
+        exclusion_outcome = "PROVEN_NOT_WORKING"
+
+    if exclusion_outcome == "PROVEN_WORKING":
         result = GateResult.PASS
         reason = (
-            "positive control proved overlay visibility with WDA_NONE, then "
-            "WDA_EXCLUDEFROMCAPTURE removed the measured signal"
+            "spatially normalized positive control saw the probe marker, then "
+            "WDA_EXCLUDEFROMCAPTURE removed the marker-specific signal"
         )
     elif external_overlay_available:
         result = GateResult.DEGRADED_SHIPPABLE
-        if not conclusive:
+        if exclusion_outcome == "PROVEN_NOT_WORKING":
+            reason = "inside capture exclusion was measured and did not work; external panel remains the safe fallback"
+        elif not conclusive:
             reason = "S1 measurement was inconclusive; external panel remains the safe fallback"
-        elif not positive_control:
-            reason = "positive control did not prove overlay detectability; negative result cannot be trusted"
         else:
-            reason = "inside overlay exclusion not cleanly verified; external panel remains the safe fallback"
+            reason = "positive control did not isolate the probe marker; negative result cannot be trusted"
     else:
         result = GateResult.FAIL
         reason = "inside overlay unresolved and no external fallback available"
@@ -146,7 +214,7 @@ def assess_s1(probe: dict | None, *, external_overlay_available: bool) -> dict:
         "reason": reason,
         "metrics": metrics,
         "positive_control_passed": positive_control,
-        "exclusion_verified": exclusion_verified,
+        "exclusion_outcome": exclusion_outcome,
         "thresholds": t,
     }
 
