@@ -15,7 +15,13 @@ class CaptureBackend(ABC):
     name: str
 
     @abstractmethod
-    def grab(self, region: Rect, monitor: MonitorInfo | None = None, *, allow_cached: bool = False) -> CapturedFrame | None:
+    def grab(
+        self,
+        region: Rect,
+        monitor: MonitorInfo | None = None,
+        *,
+        allow_cached: bool = False,
+    ) -> CapturedFrame | None:
         raise NotImplementedError
 
     def describe(self) -> dict:
@@ -28,9 +34,11 @@ class CaptureBackend(ABC):
 class DxcamBackend(CaptureBackend):
     """DXGI Desktop Duplication capture via DXcam with monitor-aware routing.
 
-    The backend captures the selected output as a full frame and crops in Python.
-    This makes the screen/global-vs-output-local region semantics explicit and
-    avoids silently passing virtual-desktop coordinates to a monitor-local API.
+    `camera.grab()` returning None is treated as "no new desktop present" rather
+    than a capture failure. When `allow_cached=True`, the last image may be
+    returned, but the resulting CapturedFrame is explicitly marked
+    `reused_cached=True` so measurement code cannot mistake cache reuse for a
+    new observation.
     """
 
     name = "dxcam-dxgi"
@@ -51,6 +59,10 @@ class DxcamBackend(CaptureBackend):
         self._output_catalog = self._parse_output_info(dxcam.output_info())
         self._last_route: dict | None = None
         self._last_full_by_route: dict[tuple[int, int], np.ndarray] = {}
+        self._new_present_count = 0
+        self._no_new_present_count = 0
+        self._cached_reuse_count = 0
+        self._last_poll_status = "NOT_POLLED"
 
     @classmethod
     def _parse_output_info(cls, text: str) -> list[dict]:
@@ -98,24 +110,39 @@ class DxcamBackend(CaptureBackend):
         }
         return camera
 
-    def grab(self, region: Rect, monitor: MonitorInfo | None = None, *, allow_cached: bool = False) -> CapturedFrame | None:
+    def grab(
+        self,
+        region: Rect,
+        monitor: MonitorInfo | None = None,
+        *,
+        allow_cached: bool = False,
+    ) -> CapturedFrame | None:
         if monitor is None:
             raise RuntimeError("DXcam monitor-aware capture requires MonitorInfo")
 
         clipped = region.intersect(monitor.rect)
         if clipped.area <= 0:
+            self._last_poll_status = "REGION_OUTSIDE_MONITOR"
             return None
 
         camera = self._camera_for_monitor(monitor)
         full = camera.grab()
         route = self._route_for_monitor(monitor)
+        reused_cached = False
         if full is None:
+            self._no_new_present_count += 1
+            self._last_poll_status = "NO_NEW_PRESENT"
             if not allow_cached:
                 return None
             full = self._last_full_by_route.get(route)
             if full is None:
                 return None
+            reused_cached = True
+            self._cached_reuse_count += 1
+            self._last_poll_status = "CACHED_REUSE"
         else:
+            self._new_present_count += 1
+            self._last_poll_status = "NEW_PRESENT"
             self._last_full_by_route[route] = np.ascontiguousarray(full)
 
         expected_hw = (monitor.rect.height, monitor.rect.width)
@@ -144,6 +171,7 @@ class DxcamBackend(CaptureBackend):
             backend=self.name,
             monitor_index=monitor.index,
             clipped=clipped != region,
+            reused_cached=reused_cached,
         )
 
     def describe(self) -> dict:
@@ -151,6 +179,13 @@ class DxcamBackend(CaptureBackend):
             "name": self.name,
             "outputs": self._output_catalog,
             "last_route": self._last_route,
+            "present_witness": {
+                "source": "dxcam grab() new-frame availability",
+                "new_present_count": self._new_present_count,
+                "no_new_present_count": self._no_new_present_count,
+                "cached_reuse_count": self._cached_reuse_count,
+                "last_poll_status": self._last_poll_status,
+            },
         }
 
     def close(self) -> None:
