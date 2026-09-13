@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any
 
@@ -15,6 +15,7 @@ class RuntimeMode(str, Enum):
 
 
 class GateResult(str, Enum):
+    NOT_RUN = "NOT_RUN"
     PASS = "PASS"
     DEGRADED_SHIPPABLE = "DEGRADED_SHIPPABLE"
     FAIL = "FAIL"
@@ -22,7 +23,7 @@ class GateResult(str, Enum):
 
 class FrameFreshness(str, Enum):
     FRESH = "FRESH"
-    DUPLICATE_OK = "DUPLICATE_OK"
+    QUIET = "QUIET"
     STALE_SUSPECT = "STALE_SUSPECT"
     BLACK = "BLACK"
 
@@ -42,8 +43,36 @@ class Rect:
     def height(self) -> int:
         return max(0, self.bottom - self.top)
 
+    @property
+    def area(self) -> int:
+        return self.width * self.height
+
     def as_region(self) -> tuple[int, int, int, int]:
         return self.left, self.top, self.right, self.bottom
+
+    def translated(self, dx: int, dy: int) -> "Rect":
+        return Rect(self.left + dx, self.top + dy, self.right + dx, self.bottom + dy)
+
+    def intersect(self, other: "Rect") -> "Rect":
+        return Rect(
+            max(self.left, other.left),
+            max(self.top, other.top),
+            min(self.right, other.right),
+            min(self.bottom, other.bottom),
+        )
+
+
+@dataclass(frozen=True)
+class MonitorInfo:
+    index: int
+    handle: int
+    rect: Rect
+    work_rect: Rect
+    device_name: str | None = None
+    primary: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass
@@ -61,6 +90,7 @@ class WindowInfo:
     runtime_mode: RuntimeMode = RuntimeMode.UNKNOWN
     runtime_confidence: float = 0.0
     runtime_reasons: list[str] = field(default_factory=list)
+    monitor: MonitorInfo | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -76,6 +106,8 @@ class CapturedFrame:
     image_bgr: np.ndarray
     region: Rect
     backend: str
+    monitor_index: int | None = None
+    clipped: bool = False
 
 
 @dataclass
@@ -83,8 +115,12 @@ class FrameHealth:
     freshness: FrameFreshness
     black_ratio: float
     mean_luma: float
-    perceptual_hash: str
-    repeated_count: int
+    content_digest: str
+    changed_tiles: int
+    max_tile_delta: float
+    mean_tile_delta: float
+    seconds_since_meaningful_change: float | None
+    learned_dynamic: bool
     reason: str = ""
 
     def to_dict(self) -> dict[str, Any]:
@@ -94,13 +130,31 @@ class FrameHealth:
 
 
 @dataclass
+class ViewportResult:
+    rect: Rect
+    mode: str
+    confidence: float
+    reason: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
 class RegistrationResult:
     mode: str
+    detector: str
     matrix_2x3: list[list[float]] | None
     inliers: int
     matches: int
-    reprojection_error: float | None
+    inlier_ratio: float
+    inlier_error_mean: float | None
+    all_match_error_mean: float | None
+    all_match_error_p90: float | None
+    scale_x: float | None
+    scale_y: float | None
     confidence: float
+    accepted: bool
     reason: str = ""
 
     def to_dict(self) -> dict[str, Any]:
