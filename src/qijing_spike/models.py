@@ -108,6 +108,9 @@ class CapturedFrame:
     backend: str
     monitor_index: int | None = None
     clipped: bool = False
+    # True only when a backend explicitly returned its previous image because no
+    # new desktop-present event was available. Measurement probes must reject it.
+    reused_cached: bool = False
 
 
 @dataclass
