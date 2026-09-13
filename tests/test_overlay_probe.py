@@ -96,12 +96,15 @@ def window():
 def images(*, moving=False):
     baseline = np.full((100, 100, 3), 100, dtype=np.uint8)
 
-    # The target is 10:30,10:30. The first same-size control block selected by
-    # the probe is 10:30,42:62 (screen x=42:62, y=10:30).
+    # Target is y=10:30,x=10:30. With a 12px gap, the valid same-size
+    # controls are right (x=42:62) and below (y=42:62). Apply equal game
+    # motion to target and both controls so only the marker remains after
+    # spatial normalization.
     motion = baseline.copy()
     if moving:
         motion[10:30, 10:30] = 125
         motion[10:30, 42:62] = 125
+        motion[42:62, 10:30] = 125
 
     contaminated = motion.copy()
     contaminated[10:30, 10:30] = 180
@@ -134,7 +137,7 @@ def test_positive_control_then_exclusion_can_pass():
     assert gate["result"] == "PASS"
 
 
-def test_equal_game_motion_under_target_and_control_is_normalized_out():
+def test_equal_game_motion_under_target_and_controls_is_normalized_out():
     baseline, motion, contaminated = images(moving=True)
     probe = run_probe(
         [make_frame(contaminated, 1), make_frame(motion, 2)],
@@ -150,10 +153,9 @@ def test_equal_game_motion_under_target_and_control_is_normalized_out():
 
 
 def test_visible_marker_after_exclusion_is_proven_not_working():
-    baseline, motion, contaminated = images(moving=True)
-    contaminated_after_exclusion = contaminated.copy()
+    baseline, _, contaminated = images(moving=True)
     probe = run_probe(
-        [make_frame(contaminated, 1), make_frame(contaminated_after_exclusion, 2)],
+        [make_frame(contaminated, 1), make_frame(contaminated, 2)],
         baseline,
     )
     gate = assess_s1(probe, external_overlay_available=True)
