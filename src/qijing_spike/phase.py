@@ -30,6 +30,7 @@ class SignalObservation:
     name: str
     phase: str
     match_score: float
+    best_scale: float | None
     threshold: float
     expected_present: bool
     supports_phase: bool
@@ -83,11 +84,7 @@ class PhaseDecision:
 
 
 class TemplatePhaseClassifier:
-    """Cheap S3 classifier driven by a versioned set of fixed UI templates.
-
-    It intentionally does not infer a phase from generic whole-frame activity.
-    Every phase vote must come from an explicit, reviewable profile signal.
-    """
+    """Cheap S3 classifier driven by explicit, versioned fixed-UI signals."""
 
     def __init__(self, config: PhaseConfig) -> None:
         self.config = config
@@ -99,27 +96,38 @@ class TemplatePhaseClassifier:
             self._templates[signal.name] = image
 
     @staticmethod
-    def _match(roi_image: np.ndarray, template_gray: np.ndarray) -> float:
+    def _match(roi_image: np.ndarray, template_gray: np.ndarray, scales: tuple[float, ...]) -> tuple[float, float | None]:
         gray = cv2.cvtColor(roi_image, cv2.COLOR_BGR2GRAY)
-        if gray.shape[0] < template_gray.shape[0] or gray.shape[1] < template_gray.shape[1]:
-            return 0.0
-        result = cv2.matchTemplate(gray, template_gray, cv2.TM_CCOEFF_NORMED)
-        if result.size == 0:
-            return 0.0
-        score = float(np.nanmax(result))
-        if not np.isfinite(score):
-            return 0.0
-        return max(-1.0, min(1.0, score))
+        best_score = -1.0
+        best_scale: float | None = None
+        for scale in scales:
+            width = max(2, int(round(template_gray.shape[1] * scale)))
+            height = max(2, int(round(template_gray.shape[0] * scale)))
+            if height > gray.shape[0] or width > gray.shape[1]:
+                continue
+            interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+            candidate = cv2.resize(template_gray, (width, height), interpolation=interpolation)
+            result = cv2.matchTemplate(gray, candidate, cv2.TM_CCOEFF_NORMED)
+            if result.size == 0:
+                continue
+            score = float(np.nanmax(result))
+            if np.isfinite(score) and score > best_score:
+                best_score = score
+                best_scale = float(scale)
+        if best_scale is None:
+            return 0.0, None
+        return max(-1.0, min(1.0, best_score)), best_scale
 
     def _observe_signal(self, viewport_bgr: np.ndarray, signal: PhaseSignalConfig) -> SignalObservation:
         roi = _crop_normalized(viewport_bgr, signal.roi)
-        score = self._match(roi, self._templates[signal.name])
+        score, best_scale = self._match(roi, self._templates[signal.name], signal.scales)
         present = score >= signal.match_threshold
         supports = present if signal.expected_present else not present
         return SignalObservation(
             name=signal.name,
             phase=signal.phase,
             match_score=score,
+            best_scale=best_scale,
             threshold=signal.match_threshold,
             expected_present=signal.expected_present,
             supports_phase=supports,
@@ -153,9 +161,11 @@ class TemplatePhaseClassifier:
             phase = winner
             reason = f"{winner.value} support={best:.3f}, margin={margin:.3f}"
 
-        # Confidence is deliberately conservative: support must be high and the
-        # competing phase must be separated. This number is not an accuracy KPI.
-        confidence = max(0.0, min(1.0, best * (0.5 + 0.5 * margin))) if phase != GamePhase.UNKNOWN else max(0.0, min(0.49, best * margin))
+        confidence = (
+            max(0.0, min(1.0, best * (0.5 + 0.5 * margin)))
+            if phase != GamePhase.UNKNOWN
+            else max(0.0, min(0.49, best * margin))
+        )
         return RawPhaseObservation(
             phase=phase,
             confidence=confidence,
@@ -225,11 +235,7 @@ class PhaseStateMachine:
                 self.candidate_phase = raw.phase
                 self.candidate_frames = 1
 
-            required = (
-                self.config.strong_confirm_frames
-                if raw.confidence >= self.config.strong_confidence
-                else self.config.confirm_frames
-            )
+            required = self.config.strong_confirm_frames if raw.confidence >= self.config.strong_confidence else self.config.confirm_frames
             if self.candidate_frames >= required:
                 self.stable_phase = raw.phase
                 self.stable_confidence = raw.confidence
