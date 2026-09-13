@@ -13,6 +13,7 @@
 - S1：透明 Overlay、点击穿透、`WDA_EXCLUDEFROMCAPTURE`
 - S1：`--probe-overlay-exclusion` 正对照 + 同尺寸空间对照块污染实验
 - S1：探针使用 72×72 小型标记，而不是 260×120 产品外面板
+- S1：最终判词依据 affinity 开/关造成的 marker-signal **差分**，排除后绝对残留仅作诊断
 - S2：真实游戏 viewport（黑边/letterbox + 可选宽高比先验）检测
 - S2：ORB + RANSAC **全仿射**参考坐标注册，安全时才允许 SCALE_ONLY 降级
 - S0/S1/S2 三值门禁：`PASS / DEGRADED_SHIPPABLE / FAIL`
@@ -20,6 +21,19 @@
 - Linux + Windows CI 单元/导入测试
 
 **尚未实现**：S3 阶段识别、S4 倒计时、S5 时间冻结假计划，以及 Product 层的英雄 OCR、GameState、策略评分、数据库、LLM、自动点击/拖拽。
+
+## 当前 Spike 继续条件
+
+在 S3/S4 尚未提供 liveness witness 前，S0 的完整 `PASS` 本来就不可达。因此当前阶段允许继续到 S3/S4 的条件是：
+
+```text
+S0 = DEGRADED_SHIPPABLE
+且唯一未闭合项是 stale/freeze 无 witness
+且 capture / black / sample-density 没有 FAIL
+且 S1 / S2 没有 FAIL
+```
+
+也就是说，**不会为了等一个构造上不可达的 S0 PASS 而阻塞 S3/S4**；等阶段识别和倒计时 witness 接入后，再重新签发 S0 的完整 PASS/FAIL。
 
 ## 环境
 
@@ -119,7 +133,7 @@ sample_sufficiency
 qijing-spike --title 王者 --duration 30 --probe-overlay-exclusion
 ```
 
-探针现在使用更接近产品真实形态的 **72×72 透明小标记**，并用目标区域附近的同尺寸控制块消除普通游戏运动。
+探针使用更接近产品真实形态的 **72×72 透明小标记**，并用目标区域附近的同尺寸控制块消除普通游戏运动。
 
 流程：
 
@@ -130,20 +144,26 @@ WDA_NONE + viewport 内显示小标记
  ↓
 F+：取得新的桌面帧
  ↓
-计算：目标块变化 - 邻近同尺寸控制块变化
- ↓
-必须观察到 marker-specific 正对照信号
+计算正对照 marker-specific signal
  ↓
 WDA_EXCLUDEFROMCAPTURE
  ↓
 F−：取得新的桌面帧
  ↓
-再次做空间归一化
+计算 exclusion 后 marker-specific signal
  ↓
-marker-specific 信号应显著下降
+比较 F+ → F− 的 signal reduction
 ```
 
-这样普通棋盘动画同时出现在目标块和控制块时，不会直接被误算成 Overlay 污染；同时正对照也不再只是证明“画面有东西在动”，而是证明**Overlay 所在局部出现了额外信号**。
+S1 是一个 affinity **干预实验**。因此最终结论只依赖“开/关 exclusion 后 marker-specific signal 是否发生足够下降”。
+
+这意味着：
+
+```text
+F− 里游戏自己仍在 marker 区运动
+```
+
+不会因为绝对残留大就被错误标成 `PROVEN_NOT_WORKING`。`excluded_signal_mean/p95` 仍保存到证据包里，但只用于诊断。
 
 S1 额外输出：
 
@@ -154,9 +174,12 @@ exclusion_outcome:
   UNMEASURED
 ```
 
-因此“已经证明排除失败”和“这次没测到”不会再被压成同一种语义。
+其中 `PROVEN_NOT_WORKING` 只允许在：
 
-任一测量帧来自缓存、拿不到新帧、没有同尺寸控制块或正对照无法隔离 marker-specific 信号，都不能 PASS。
+- affinity API 明确失败；或
+- 正对照成立后，开启 exclusion 没有产生足够 signal reduction。
+
+任一测量帧来自缓存、拿不到新帧、没有同尺寸控制块或正对照无法隔离 marker-specific signal，都不能 PASS。
 
 如果游戏内 Overlay 无法证明干净，但外置面板可用，S1 为 `DEGRADED_SHIPPABLE`。
 
@@ -212,7 +235,9 @@ pytest
 - new-present 样本密度随实验时长缩放
 - `WINDOW_UNAVAILABLE` 不作为 capture error
 - S1 正对照通过后排除成功
-- **活动游戏画面经过同尺寸控制块归一化后仍可正确 PASS**
+- 活动游戏画面经过同尺寸控制块归一化后仍可正确 PASS
+- **marker 区局部运动存在时，排除成功仍依据差分正确 PASS**
+- **marker 区局部运动 + 排除失败时仍正确 `PROVEN_NOT_WORKING`**
 - S1 排除失败产生 `PROVEN_NOT_WORKING`
 - 缓存帧不能产生 S1 假 PASS
 - 正对照不可见时产生 `UNMEASURED`
