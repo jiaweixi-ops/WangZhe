@@ -23,8 +23,9 @@ SPIKE_THRESHOLDS = {
     "s1": {
         "min_positive_control_signal_mean": 4.0,
         "min_positive_control_signal_p95": 18.0,
-        "max_excluded_signal_mean": 3.0,
-        "max_excluded_signal_p95": 14.0,
+        # S1 is an intervention test. The verdict is based on the signal change
+        # caused by toggling WDA_EXCLUDEFROMCAPTURE, not on the absolute residual
+        # in F-. Absolute excluded-frame motion remains diagnostic evidence only.
         "min_signal_reduction_mean": 3.0,
     },
     "s2": {
@@ -172,21 +173,22 @@ def assess_s1(probe: dict | None, *, external_overlay_available: bool) -> dict:
         or metrics.get("positive_control_signal_p95", -1.0)
         >= t["min_positive_control_signal_p95"]
     )
-    excluded_clean = (
-        metrics.get("excluded_signal_mean", float("inf"))
-        <= t["max_excluded_signal_mean"]
-        and metrics.get("excluded_signal_p95", float("inf"))
-        <= t["max_excluded_signal_p95"]
-        and metrics.get("signal_reduction_mean", -1.0)
+    signal_reduction_sufficient = (
+        metrics.get("signal_reduction_mean", -1.0)
         >= t["min_signal_reduction_mean"]
     )
     affinity_ok = bool((probe.get("capture_exclusion") or {}).get("success"))
 
+    # S1 is fundamentally an A/B intervention. Once the positive control proves
+    # that the marker is measurable, only the measured reduction after enabling
+    # exclusion is allowed to classify the affinity effect. Absolute residual
+    # motion in F- can be game animation local to the marker area and therefore
+    # cannot prove that exclusion failed.
     if not conclusive or not positive_control:
         exclusion_outcome = "UNMEASURED"
     elif not affinity_ok:
         exclusion_outcome = "PROVEN_NOT_WORKING"
-    elif excluded_clean:
+    elif signal_reduction_sufficient:
         exclusion_outcome = "PROVEN_WORKING"
     else:
         exclusion_outcome = "PROVEN_NOT_WORKING"
@@ -194,13 +196,13 @@ def assess_s1(probe: dict | None, *, external_overlay_available: bool) -> dict:
     if exclusion_outcome == "PROVEN_WORKING":
         result = GateResult.PASS
         reason = (
-            "spatially normalized positive control saw the probe marker, then "
-            "WDA_EXCLUDEFROMCAPTURE removed the marker-specific signal"
+            "positive control isolated the probe marker and enabling "
+            "WDA_EXCLUDEFROMCAPTURE produced the required marker-signal reduction"
         )
     elif external_overlay_available:
         result = GateResult.DEGRADED_SHIPPABLE
         if exclusion_outcome == "PROVEN_NOT_WORKING":
-            reason = "inside capture exclusion was measured and did not work; external panel remains the safe fallback"
+            reason = "the affinity intervention produced insufficient marker-signal reduction; external panel remains the safe fallback"
         elif not conclusive:
             reason = "S1 measurement was inconclusive; external panel remains the safe fallback"
         else:
@@ -215,6 +217,7 @@ def assess_s1(probe: dict | None, *, external_overlay_available: bool) -> dict:
         "metrics": metrics,
         "positive_control_passed": positive_control,
         "exclusion_outcome": exclusion_outcome,
+        "verdict_basis": "AFFINITY_DIFFERENTIAL_SIGNAL_REDUCTION",
         "thresholds": t,
     }
 

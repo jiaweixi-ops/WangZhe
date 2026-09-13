@@ -111,6 +111,28 @@ def images(*, moving=False):
     return baseline, motion, contaminated
 
 
+def localized_motion_images():
+    """Game motion exists only beneath the marker, not in nearby controls.
+
+    This is the hard case from probe7: after exclusion succeeds, F- still has
+    large absolute residual motion in the marker area. The S1 verdict must use
+    the affinity-induced reduction, not the absolute residual.
+    """
+    baseline = np.full((100, 100, 3), 100, dtype=np.uint8)
+
+    # Positive sample = local game motion + visible marker.
+    positive = baseline.copy()
+    positive[10:30, 10:30] = 180
+
+    # Excluded sample = the marker is gone, but the game underneath moved.
+    excluded_success = baseline.copy()
+    excluded_success[10:30, 10:30] = 137
+
+    # Exclusion failure = marker remains visible on top of the same local motion.
+    excluded_failure = positive.copy()
+    return baseline, positive, excluded_success, excluded_failure
+
+
 def run_probe(frames, baseline):
     return probe_overlay_exclusion(
         backend=StubBackend(frames),
@@ -150,6 +172,36 @@ def test_equal_game_motion_under_target_and_controls_is_normalized_out():
     assert probe["metrics"]["excluded_signal_mean"] == 0.0
     assert gate["exclusion_outcome"] == "PROVEN_WORKING"
     assert gate["result"] == "PASS"
+
+
+def test_local_game_motion_under_marker_does_not_prove_exclusion_failed():
+    baseline, positive, excluded_success, _ = localized_motion_images()
+    probe = run_probe(
+        [make_frame(positive, 1), make_frame(excluded_success, 2)],
+        baseline,
+    )
+    gate = assess_s1(probe, external_overlay_available=True)
+
+    assert gate["positive_control_passed"] is True
+    assert probe["metrics"]["excluded_signal_mean"] > 3.0
+    assert probe["metrics"]["signal_reduction_mean"] >= 3.0
+    assert gate["verdict_basis"] == "AFFINITY_DIFFERENTIAL_SIGNAL_REDUCTION"
+    assert gate["exclusion_outcome"] == "PROVEN_WORKING"
+    assert gate["result"] == "PASS"
+
+
+def test_local_game_motion_with_marker_still_visible_is_proven_not_working():
+    baseline, positive, _, excluded_failure = localized_motion_images()
+    probe = run_probe(
+        [make_frame(positive, 1), make_frame(excluded_failure, 2)],
+        baseline,
+    )
+    gate = assess_s1(probe, external_overlay_available=True)
+
+    assert gate["positive_control_passed"] is True
+    assert probe["metrics"]["signal_reduction_mean"] == 0.0
+    assert gate["exclusion_outcome"] == "PROVEN_NOT_WORKING"
+    assert gate["result"] == "DEGRADED_SHIPPABLE"
 
 
 def test_visible_marker_after_exclusion_is_proven_not_working():
