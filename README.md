@@ -7,13 +7,14 @@
 - S−1：运行形态识别（原生 PC / 模拟器 / 云串流候选）
 - S0：DXGI Desktop Duplication 捕获（DXcam）
 - S0：监视器感知、多显示器路由、窗口越界裁剪
-- S0：ROI/网格级局部变化、新鲜帧、黑帧、冻结嫌疑检查
+- S0：ROI/网格级局部变化、新鲜帧、黑帧检查
+- S0：区分“无新桌面呈现”与真正 capture error
 - S1：透明 Overlay、点击穿透、`WDA_EXCLUDEFROMCAPTURE`
-- S1：`--probe-overlay-exclusion` 客户区内 hide/show/hide 污染实验
+- S1：`--probe-overlay-exclusion` 正对照污染实验
 - S2：真实游戏 viewport（黑边/letterbox + 可选宽高比先验）检测
 - S2：ORB + RANSAC **全仿射**参考坐标注册，安全时才允许 SCALE_ONLY 降级
 - S0/S1/S2 三值门禁：`PASS / DEGRADED_SHIPPABLE / FAIL`
-- 完整证据 JSON（环境、帧 gap、全部 registration 样本与聚合）
+- 完整证据 JSON（环境、present witness、全部 registration 样本与聚合）
 - Linux + Windows CI 单元/导入测试
 
 **尚未实现**：S3 阶段识别、S4 倒计时、S5 时间冻结假计划，以及 Product 层的英雄 OCR、GameState、策略评分、数据库、LLM、自动点击/拖拽。
@@ -59,31 +60,55 @@ artifacts/spike-YYYYMMDD-HHMMSS/
 ├─ health.json
 ├─ viewport.json
 ├─ registration.json
-├─ none_grabs.json
+├─ no_new_presents.json
 └─ capture_gaps.json
 ```
 
-Freshness 不再依赖 `--expected-change`；旧参数仍可接受但会被忽略。监视器会先从近期真实局部变化学习“这是动态画面”，之后长时间平坦才升级为 `STALE_SUSPECT`。
+### DXGI / DXcam 语义
+
+DXcam 的 one-shot `grab()` 在没有新的桌面呈现时可以返回 `None`。本 Spike 将它记录成：
+
+```text
+NO_NEW_PRESENT
+```
+
+而不是 capture failure。因此合法静止画面不会因为大量 `None` 被 S0 判坏。
+
+如果某个实验显式允许复用上一帧，`CapturedFrame.reused_cached=True` 会保留该 provenance。**缓存帧不得用于证明 S1 排除成功。**
+
+Freshness 仍会记录局部活动和静止时长，但仅在未来 S3/S4 或其它独立 witness 明确给出 `activity_expected=True` 时，才允许升级为 `STALE_SUSPECT`。单纯“刚才动过、现在静止 3 秒”不会再被当作冻结。
 
 ## 3. 真正验证 S1 Overlay 污染
 
-只把面板放外面不能证明捕获排除生效。请在相对稳定的准备画面运行：
+请在相对稳定的准备画面运行：
 
 ```powershell
 qijing-spike --title 王者 --duration 30 --probe-overlay-exclusion
 ```
 
-程序会执行：
+S1 不再用“没看到 Overlay”直接证明成功，而是先证明仪器能看到已知阳性信号：
 
 ```text
-隐藏 Overlay → F0
-显示 Overlay（viewport 内）→ F1
-再次隐藏 → F2
+F0：Overlay 隐藏，取得非缓存 baseline
+ ↓
+关闭排除（WDA_NONE）
+ ↓
+viewport 内显示 Overlay
+ ↓
+F+：必须取得新的桌面帧，并显著看到 Overlay        ← 正对照
+ ↓
+重新开启 WDA_EXCLUDEFROMCAPTURE
+ ↓
+F−：必须取得新的桌面帧
+ ↓
+确认 Overlay 信号显著下降并落到阈值内          ← 阴性验证
 ```
 
-并比较重叠区域：`F1` 的额外变化是否显著高于 `F0↔F2` 背景变化，同时记录 `SetWindowDisplayAffinity` 的返回值和 Win32 last-error。
+任一测量帧来自缓存、拿不到新的桌面帧、正对照看不到 Overlay，都会得到 **inconclusive**，S1 不允许 PASS。
 
-若客户区内 Overlay 无法证明干净，S1 会降级为 `DEGRADED_SHIPPABLE`，产品仍可使用外置面板。
+若客户区内排除无法被证明，但外置面板可用，S1 为 `DEGRADED_SHIPPABLE`。
+
+探针运行期间会重置主循环 gap/freshness 基线，不把 probe 自身的 sleep/affinity 切换计成 S0 捕获 gap。
 
 ## 4. 参考坐标注册
 
@@ -129,8 +154,13 @@ pytest
 当前单元测试覆盖：
 
 - 小范围真实 UI 变化
-- 动态画面冻结
-- 静态画面不被无条件误报 stale
+- 合法静止不因历史活动被误报 stale
+- 外部 activity witness 可触发 stale
+- S1 正对照通过后排除成功
+- S1 排除失败降级
+- **缓存帧不能产生 S1 假 PASS**
+- 正对照不可见时不能 PASS
+- DXGI `NO_NEW_PRESENT` 不作为 capture error
 - viewport 显式失败/降级
 - Rect 数学
 - registration 导入与 ORB 兼容
