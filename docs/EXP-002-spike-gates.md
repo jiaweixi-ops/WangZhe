@@ -62,8 +62,6 @@ stale_metric_status = NO_WITNESS_DEFERRED_TO_S3_S4
 
 ### 样本量随时长归一化
 
-不再使用“总共至少 5 个 NEW_PRESENT”作为 PASS 条件。
-
 当前使用：
 
 ```text
@@ -76,56 +74,94 @@ new_present_frames_per_minute
 
 ## S1 Overlay
 
-S1 的原则是：
+S1 的核心原则：
 
-> 一个探测不到已知阳性信号的方法，不能用来证明阴性。
+> **不要从“这块画面变了多少”推断 marker 是否存在；直接检测我们自己画的 marker。**
 
-同时：
+通用区域差分会把游戏运动与 Overlay 像素混在一起，已经证明会在不同场景下产生假 PASS 与假阴性。因此从本版本开始，通用 diff 只保留为诊断证据，完全退出 S1 判词。
 
-> 游戏自身运动不能被直接当成 Overlay 污染。
+### Probe 签名
 
-因此 PASS 必须运行 `--probe-overlay-exclusion`，并执行**正对照 + 空间对照 + affinity 差分**：
+Probe 仍使用约 72×72 的产品近似小标记，但测试样式是专门的测量签名：
+
+```text
+不透明饱和品红方框边缘
++
+不透明青色十字
+```
+
+颜色、线宽和几何全部由程序自身定义。
+
+探针在 marker 矩形内分别检测：
+
+- 品红边框的几何覆盖率；
+- 青色十字的几何覆盖率；
+- `marker_score = min(border_coverage, cross_coverage)`。
+
+这意味着普通游戏动画、粒子或血条变化不会仅因为“像素变化很大”而被当成 marker。
+
+### 流程
 
 1. Overlay 隐藏，取得一个非缓存 baseline `F0`；
-2. Probe 切换成产品近似几何的小型透明 marker，而不是 260×120 面板；
-3. 显示 marker 到 viewport 内；
-4. 显式设置 `WDA_NONE`；
+2. 切换到签名 marker；
+3. 显示 marker 到 viewport 内，要求 marker 完整未裁剪；
+4. 设置 `WDA_NONE`；
 5. 取得新的桌面呈现 `F+`；
-6. 在 marker 重叠区域旁选择一个或多个同尺寸控制块；
-7. 对 `F+` 计算空间归一化 marker signal；
-8. 正对照必须超过阈值，证明 marker 本身可被测量；
-9. 设置 `WDA_EXCLUDEFROMCAPTURE`；
-10. 取得新的桌面呈现 `F−`；
-11. 对 `F−` 做同样空间归一化；
-12. 判词只依据 **`F+ → F−` 的 marker-signal reduction**；
-13. `F−` 的绝对残留只保留作诊断证据，不能单独证明 exclusion 失败；
-14. 同时记录两次 `SetWindowDisplayAffinity` 返回值和 last-error。
+6. 直接检测 `F+` 中的 marker 签名；
+7. `F+` 必须达到 `min_positive_marker_score`，否则仪器没有看到已知阳性 → `UNMEASURED`；
+8. 设置 `WDA_EXCLUDEFROMCAPTURE`；
+9. 取得新的桌面呈现 `F−`；
+10. 直接检测 `F−` 中的 marker 签名；
+11. 根据 marker 是否消失/保留判定 affinity 是否工作。
 
-使用多个可用同尺寸控制块时，控制运动取中位值，以减少单一局部动画对结论的影响。
-
-### 为什么不用 F− 的绝对残留判失败
-
-marker 所在棋盘区域可能发生局部动画，而邻近控制块完全静止。此时即使 exclusion 已正确移除 marker：
+### 判词
 
 ```text
-F− vs F0
+positive marker score 足够
++
+excluded marker score 足够低
++
+retained fraction 足够低
+→ PROVEN_WORKING / PASS
 ```
-
-仍可能有很大的绝对残留。
-
-因此：
 
 ```text
-excluded_signal 大
-!=
-exclusion 失败
+positive marker score 足够
++
+excluded marker 仍保留大部分签名
+→ PROVEN_NOT_WORKING / DEGRADED_SHIPPABLE
 ```
 
-只有在正对照成立后，**开启 affinity 没有产生足够的 marker-signal reduction**，才允许输出 `PROVEN_NOT_WORKING`。
+```text
+两者之间的模糊区
+→ UNMEASURED / DEGRADED_SHIPPABLE
+```
 
-### S1 正交结果字段
+**模糊证据禁止强行判成功或失败。**
 
-三值门禁之外必须保留：
+### 通用运动证据
+
+以下旧指标仍可写入 evidence：
+
+```text
+positive_control_signal_mean
+excluded_signal_mean
+signal_reduction_mean
+control block motion
+```
+
+但它们只用于排查游戏动画、采样时距等现象，**不参与 S1 PASS/FAIL**。
+
+因此，即使出现：
+
+```text
+F+ 游戏运动很强
+F− 游戏运动变弱
+```
+
+只要 marker 在 F− 仍然存在，就不能因为 generic diff reduction 很大而错误签发 `PROVEN_WORKING`。
+
+### 正交结果字段
 
 ```yaml
 exclusion_outcome:
@@ -134,27 +170,15 @@ exclusion_outcome:
   UNMEASURED
 ```
 
-含义：
-
-- `PROVEN_WORKING`：正对照成立，开启 exclusion 后 marker-signal reduction 达到阈值；
-- `PROVEN_NOT_WORKING`：正对照成立，但 affinity API 失败，或 affinity 切换没有产生足够差分；
-- `UNMEASURED`：没有拿到新帧、缓存帧、正对照不成立、没有控制块等，无法证明正/负。
-
-这样“已证明失败”和“本次没测到”即使都因外置面板 fallback 得到 `DEGRADED_SHIPPABLE`，证据语义仍然不同。
-
 以下任一情况禁止 PASS：
 
 - baseline / positive / excluded 任一帧来自 cache；
 - 正对照拿不到新帧；
-- 空间归一化后看不到 marker-specific 正对照；
-- viewport 内无法放置同尺寸控制块；
-- 开启排除后拿不到新的阴性测量帧；
+- marker 被 viewport/client 裁剪；
+- `F+` 检测不到已知 marker 签名；
+- 开启 exclusion 后拿不到新的阴性测量帧；
 - affinity API 失败；
-- affinity 切换后的 marker-signal reduction 低于阈值。
-
-注意：
-
-> **排除后仍存在较大的绝对游戏运动，不再是失败条件。**
+- marker 签名证据落在模糊区。
 
 如果游戏内 Overlay 无法证明干净，但外置面板可用：`DEGRADED_SHIPPABLE`。
 
