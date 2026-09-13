@@ -1,8 +1,19 @@
+import cv2
 import numpy as np
 
 from qijing_spike.gates import assess_s1
 from qijing_spike.models import CapturedFrame, MonitorInfo, Rect, WindowInfo
+from qijing_spike.overlay import (
+    PROBE_MARKER_BORDER_RGB,
+    PROBE_MARKER_CROSS_HALF,
+    PROBE_MARKER_CROSS_RGB,
+    PROBE_MARKER_INSET,
+    PROBE_MARKER_LINE_WIDTH,
+)
 from qijing_spike.overlay_probe import probe_overlay_exclusion
+
+
+TARGET = Rect(10, 10, 30, 30)
 
 
 def make_frame(image, idx, *, cached=False):
@@ -40,7 +51,7 @@ class StubOverlay:
         self.capture_exclusion_result = None
         self.click_through_result = {"success": True}
         self.capture_affinity_history = []
-        self._rect = Rect(10, 10, 30, 30)
+        self._rect = TARGET
         self.visible = False
         self.probe_mode = False
 
@@ -93,44 +104,45 @@ def window():
     )
 
 
-def images(*, moving=False):
-    baseline = np.full((100, 100, 3), 100, dtype=np.uint8)
-
-    # Target is y=10:30,x=10:30. With a 12px gap, the valid same-size
-    # controls are right (x=42:62) and below (y=42:62). Apply equal game
-    # motion to target and both controls so only the marker remains after
-    # spatial normalization.
-    motion = baseline.copy()
-    if moving:
-        motion[10:30, 10:30] = 125
-        motion[10:30, 42:62] = 125
-        motion[42:62, 10:30] = 125
-
-    contaminated = motion.copy()
-    contaminated[10:30, 10:30] = 180
-    return baseline, motion, contaminated
+def _bgr(rgb):
+    return int(rgb[2]), int(rgb[1]), int(rgb[0])
 
 
-def localized_motion_images():
-    """Game motion exists only beneath the marker, not in nearby controls.
+def draw_probe_marker(image: np.ndarray, rect: Rect = TARGET) -> np.ndarray:
+    out = image.copy()
+    w, h = rect.width, rect.height
+    scale = min(w, h) / 72.0
+    inset = max(1, int(round(PROBE_MARKER_INSET * scale)))
+    line_width = max(1, int(round(PROBE_MARKER_LINE_WIDTH * scale)))
+    cross_half = max(2, int(round(PROBE_MARKER_CROSS_HALF * scale)))
 
-    This is the hard case from probe7: after exclusion succeeds, F- still has
-    large absolute residual motion in the marker area. The S1 verdict must use
-    the affinity-induced reduction, not the absolute residual.
-    """
-    baseline = np.full((100, 100, 3), 100, dtype=np.uint8)
+    x0 = rect.left + inset
+    y0 = rect.top + inset
+    x1 = rect.right - inset - 1
+    y1 = rect.bottom - inset - 1
+    cv2.rectangle(out, (x0, y0), (x1, y1), _bgr(PROBE_MARKER_BORDER_RGB), line_width)
 
-    # Positive sample = local game motion + visible marker.
-    positive = baseline.copy()
-    positive[10:30, 10:30] = 180
+    cx = rect.left + w // 2
+    cy = rect.top + h // 2
+    cv2.line(
+        out,
+        (max(rect.left, cx - cross_half), cy),
+        (min(rect.right - 1, cx + cross_half), cy),
+        _bgr(PROBE_MARKER_CROSS_RGB),
+        line_width,
+    )
+    cv2.line(
+        out,
+        (cx, max(rect.top, cy - cross_half)),
+        (cx, min(rect.bottom - 1, cy + cross_half)),
+        _bgr(PROBE_MARKER_CROSS_RGB),
+        line_width,
+    )
+    return out
 
-    # Excluded sample = the marker is gone, but the game underneath moved.
-    excluded_success = baseline.copy()
-    excluded_success[10:30, 10:30] = 137
 
-    # Exclusion failure = marker remains visible on top of the same local motion.
-    excluded_failure = positive.copy()
-    return baseline, positive, excluded_success, excluded_failure
+def base_image(value=100):
+    return np.full((100, 100, 3), value, dtype=np.uint8)
 
 
 def run_probe(frames, baseline):
@@ -147,35 +159,30 @@ def run_probe(frames, baseline):
 
 
 def test_positive_control_then_exclusion_can_pass():
-    baseline, _, contaminated = images()
+    baseline = base_image()
+    positive = draw_probe_marker(baseline)
     probe = run_probe(
-        [make_frame(contaminated, 1), make_frame(baseline, 2)],
+        [make_frame(positive, 1), make_frame(baseline, 2)],
         baseline,
     )
     gate = assess_s1(probe, external_overlay_available=True)
     assert probe["conclusive"] is True
     assert gate["positive_control_passed"] is True
-    assert gate["exclusion_outcome"] == "PROVEN_WORKING"
-    assert gate["result"] == "PASS"
-
-
-def test_equal_game_motion_under_target_and_controls_is_normalized_out():
-    baseline, motion, contaminated = images(moving=True)
-    probe = run_probe(
-        [make_frame(contaminated, 1), make_frame(motion, 2)],
-        baseline,
-    )
-    gate = assess_s1(probe, external_overlay_available=True)
-    assert gate["positive_control_passed"] is True
-    assert probe["metrics"]["positive_control_motion_mean"] > 0
-    assert probe["metrics"]["excluded_target_mean"] > 0
-    assert probe["metrics"]["excluded_signal_mean"] == 0.0
+    assert gate["verdict_basis"] == "MARKER_SIGNATURE_PRESENCE"
     assert gate["exclusion_outcome"] == "PROVEN_WORKING"
     assert gate["result"] == "PASS"
 
 
 def test_local_game_motion_under_marker_does_not_prove_exclusion_failed():
-    baseline, positive, excluded_success, _ = localized_motion_images()
+    baseline = base_image()
+
+    positive_underlay = baseline.copy()
+    positive_underlay[10:30, 10:30] = 180
+    positive = draw_probe_marker(positive_underlay)
+
+    excluded_success = baseline.copy()
+    excluded_success[10:30, 10:30] = 137
+
     probe = run_probe(
         [make_frame(positive, 1), make_frame(excluded_success, 2)],
         baseline,
@@ -183,15 +190,29 @@ def test_local_game_motion_under_marker_does_not_prove_exclusion_failed():
     gate = assess_s1(probe, external_overlay_available=True)
 
     assert gate["positive_control_passed"] is True
-    assert probe["metrics"]["excluded_signal_mean"] > 3.0
-    assert probe["metrics"]["signal_reduction_mean"] >= 3.0
-    assert gate["verdict_basis"] == "AFFINITY_DIFFERENTIAL_SIGNAL_REDUCTION"
+    assert probe["metrics"]["excluded_target_mean"] > 3.0
+    assert probe["metrics"]["excluded_marker_score"] < 0.10
     assert gate["exclusion_outcome"] == "PROVEN_WORKING"
     assert gate["result"] == "PASS"
 
 
-def test_local_game_motion_with_marker_still_visible_is_proven_not_working():
-    baseline, positive, _, excluded_failure = localized_motion_images()
+def test_asymmetric_local_motion_cannot_fake_exclusion_success_when_marker_remains():
+    """Regression for probe8 scenario 9.
+
+    F+ has stronger local game motion than F-, so a generic difference-reduction
+    verdict would incorrectly certify exclusion. The known marker remains visible
+    in F-, therefore the signature verdict must prove exclusion did NOT work.
+    """
+    baseline = base_image()
+
+    positive_underlay = baseline.copy()
+    positive_underlay[10:30, 10:30] = 180
+    positive = draw_probe_marker(positive_underlay)
+
+    excluded_underlay = baseline.copy()
+    excluded_underlay[10:30, 10:30] = 112
+    excluded_failure = draw_probe_marker(excluded_underlay)
+
     probe = run_probe(
         [make_frame(positive, 1), make_frame(excluded_failure, 2)],
         baseline,
@@ -199,13 +220,36 @@ def test_local_game_motion_with_marker_still_visible_is_proven_not_working():
     gate = assess_s1(probe, external_overlay_available=True)
 
     assert gate["positive_control_passed"] is True
-    assert probe["metrics"]["signal_reduction_mean"] == 0.0
+    # Diagnostic generic motion is allowed to suggest a reduction; it has no
+    # verdict authority anymore.
+    assert probe["metrics"]["positive_marker_score"] >= 0.30
+    assert probe["metrics"]["excluded_marker_score"] >= 0.30
+    assert probe["metrics"]["marker_retained_fraction"] >= 0.60
     assert gate["exclusion_outcome"] == "PROVEN_NOT_WORKING"
     assert gate["result"] == "DEGRADED_SHIPPABLE"
 
 
+def test_uniform_game_motion_does_not_hide_marker_signature():
+    baseline = base_image()
+    moving = base_image(125)
+    positive = draw_probe_marker(moving)
+
+    probe = run_probe(
+        [make_frame(positive, 1), make_frame(moving, 2)],
+        baseline,
+    )
+    gate = assess_s1(probe, external_overlay_available=True)
+
+    assert gate["positive_control_passed"] is True
+    assert probe["metrics"]["positive_marker_score"] >= 0.30
+    assert probe["metrics"]["excluded_marker_score"] < 0.10
+    assert gate["exclusion_outcome"] == "PROVEN_WORKING"
+    assert gate["result"] == "PASS"
+
+
 def test_visible_marker_after_exclusion_is_proven_not_working():
-    baseline, _, contaminated = images(moving=True)
+    baseline = base_image()
+    contaminated = draw_probe_marker(baseline)
     probe = run_probe(
         [make_frame(contaminated, 1), make_frame(contaminated, 2)],
         baseline,
@@ -216,8 +260,28 @@ def test_visible_marker_after_exclusion_is_proven_not_working():
     assert gate["result"] == "DEGRADED_SHIPPABLE"
 
 
+def test_ambiguous_partial_signature_is_unmeasured_not_forced_to_pass_or_fail():
+    baseline = base_image()
+    positive = draw_probe_marker(baseline)
+    partial = draw_probe_marker(baseline)
+    # Erase roughly half the signature. This should land between clean removal
+    # and clear retention and therefore remain explicitly unmeasured.
+    partial[10:30, 20:30] = baseline[10:30, 20:30]
+
+    probe = run_probe(
+        [make_frame(positive, 1), make_frame(partial, 2)],
+        baseline,
+    )
+    gate = assess_s1(probe, external_overlay_available=True)
+    assert gate["positive_control_passed"] is True
+    assert gate["exclusion_outcome"] in {"UNMEASURED", "PROVEN_NOT_WORKING"}
+    # The only forbidden result here is a false certification.
+    assert gate["result"] != "PASS"
+
+
 def test_cached_frames_cannot_prove_exclusion():
-    baseline, _, contaminated = images()
+    baseline = base_image()
+    contaminated = draw_probe_marker(baseline)
     cached = make_frame(contaminated, 1, cached=True)
     probe = run_probe([cached], baseline)
     gate = assess_s1(probe, external_overlay_available=True)
@@ -227,9 +291,9 @@ def test_cached_frames_cannot_prove_exclusion():
 
 
 def test_missing_positive_control_cannot_pass():
-    baseline, motion, _ = images(moving=True)
+    baseline = base_image()
     probe = run_probe(
-        [make_frame(motion, 1), make_frame(motion, 2)],
+        [make_frame(baseline, 1), make_frame(baseline, 2)],
         baseline,
     )
     gate = assess_s1(probe, external_overlay_available=True)
