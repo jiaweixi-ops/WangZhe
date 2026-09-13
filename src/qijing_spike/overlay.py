@@ -81,6 +81,9 @@ def _move_physical(hwnd: int, x: int, y: int) -> bool:
 
 if sys.platform == "win32":
     class SpikeOverlay(QtWidgets.QWidget):
+        PANEL_SIZE = (260, 120)
+        PROBE_MARKER_SIZE = (72, 72)
+
         def __init__(self) -> None:
             super().__init__()
             self.setWindowTitle("Qijing Spike Overlay")
@@ -91,8 +94,9 @@ if sys.platform == "win32":
                 | QtCore.Qt.WindowTransparentForInput
             )
             self.setAttribute(QtCore.Qt.WA_TranslucentBackground)
-            self.resize(260, 120)
+            self.resize(*self.PANEL_SIZE)
             self._text = "棋镜 Spike\nTEST PLAN"
+            self._probe_marker_mode = False
             self.capture_exclusion_result: dict | None = None
             self.click_through_result: dict | None = None
             self.capture_affinity_history: list[dict] = []
@@ -108,6 +112,14 @@ if sys.platform == "win32":
             if text == self._text:
                 return
             self._text = text
+            self.update()
+
+        def set_probe_marker_mode(self, enabled: bool) -> None:
+            enabled = bool(enabled)
+            if enabled == self._probe_marker_mode:
+                return
+            self._probe_marker_mode = enabled
+            self.resize(*(self.PROBE_MARKER_SIZE if enabled else self.PANEL_SIZE))
             self.update()
 
         def set_capture_excluded(self, excluded: bool) -> dict:
@@ -160,6 +172,23 @@ if sys.platform == "win32":
         def paintEvent(self, event) -> None:
             painter = QtGui.QPainter(self)
             painter.setRenderHint(QtGui.QPainter.Antialiasing)
+
+            if self._probe_marker_mode:
+                # Product-like small in-game marker: transparent center, bright
+                # border/crosshair. This avoids certifying a geometry the product
+                # would never draw (the old 260x120 opaque panel).
+                pen = QtGui.QPen(QtGui.QColor(40, 235, 145, 240))
+                pen.setWidth(4)
+                painter.setPen(pen)
+                painter.setBrush(QtCore.Qt.NoBrush)
+                box = self.rect().adjusted(5, 5, -5, -5)
+                painter.drawRoundedRect(box, 8, 8)
+                cx = self.rect().center().x()
+                cy = self.rect().center().y()
+                painter.drawLine(cx - 12, cy, cx + 12, cy)
+                painter.drawLine(cx, cy - 12, cx, cy + 12)
+                return
+
             painter.setBrush(QtGui.QColor(22, 26, 34, 225))
             painter.setPen(QtCore.Qt.NoPen)
             painter.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 12, 12)
