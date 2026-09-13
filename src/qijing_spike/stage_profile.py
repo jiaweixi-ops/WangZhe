@@ -7,6 +7,7 @@ from typing import Any
 
 
 VALID_PHASES = {"PREPARATION", "COMBAT"}
+DEFAULT_TEMPLATE_SCALES = (0.75, 0.875, 1.0, 1.125, 1.25)
 
 
 def _norm_rect(value: list[float] | tuple[float, float, float, float], *, name: str) -> tuple[float, float, float, float]:
@@ -27,6 +28,7 @@ class PhaseSignalConfig:
     match_threshold: float = 0.85
     weight: float = 1.0
     expected_present: bool = True
+    scales: tuple[float, ...] = DEFAULT_TEMPLATE_SCALES
 
 
 @dataclass(frozen=True)
@@ -93,6 +95,9 @@ def _load_phase(base: Path, payload: dict[str, Any]) -> PhaseConfig:
         if phase not in VALID_PHASES:
             raise ValueError(f"phase.signals[{index}].phase must be PREPARATION or COMBAT")
         template_path = _resolve(base, str(raw["template"]))
+        scales = tuple(float(v) for v in raw.get("scales", DEFAULT_TEMPLATE_SCALES))
+        if not scales or any(v <= 0 for v in scales):
+            raise ValueError(f"phase.signals[{index}].scales must contain positive values")
         signals.append(
             PhaseSignalConfig(
                 name=str(raw.get("name", f"signal_{index}")),
@@ -102,10 +107,15 @@ def _load_phase(base: Path, payload: dict[str, Any]) -> PhaseConfig:
                 match_threshold=float(raw.get("match_threshold", 0.85)),
                 weight=float(raw.get("weight", 1.0)),
                 expected_present=bool(raw.get("expected_present", True)),
+                scales=scales,
             )
         )
     if not signals:
         raise ValueError("phase.signals must contain at least one template signal")
+    phases_present = {signal.phase for signal in signals}
+    missing = VALID_PHASES - phases_present
+    if missing:
+        raise ValueError(f"phase.signals must include explicit signals for both phases; missing {sorted(missing)}")
     return PhaseConfig(
         signals=tuple(signals),
         min_support=float(payload.get("min_support", 0.55)),
