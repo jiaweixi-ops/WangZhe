@@ -7,14 +7,14 @@ from qijing_spike.phase import GamePhase, PhaseStateMachine, TemplatePhaseClassi
 from qijing_spike.stage_profile import PhaseConfig, PhaseSignalConfig
 
 
-def _pattern(kind: str) -> np.ndarray:
-    image = np.zeros((20, 20, 3), dtype=np.uint8)
+def _pattern(kind: str, size: int = 20) -> np.ndarray:
+    image = np.zeros((size, size, 3), dtype=np.uint8)
     if kind == "prep":
-        cv2.rectangle(image, (3, 3), (16, 16), (255, 255, 255), 2)
-        cv2.line(image, (4, 10), (15, 10), (255, 255, 255), 2)
+        cv2.rectangle(image, (3, 3), (size - 4, size - 4), (255, 255, 255), 2)
+        cv2.line(image, (4, size // 2), (size - 5, size // 2), (255, 255, 255), 2)
     else:
-        cv2.circle(image, (10, 10), 7, (255, 255, 255), 2)
-        cv2.line(image, (10, 3), (10, 17), (255, 255, 255), 2)
+        cv2.circle(image, (size // 2, size // 2), max(3, size // 3), (255, 255, 255), 2)
+        cv2.line(image, (size // 2, 3), (size // 2, size - 4), (255, 255, 255), 2)
     return image
 
 
@@ -57,6 +57,17 @@ def test_phase_classifier_identifies_preparation(tmp_path):
     assert raw.confidence >= 0.9
 
 
+def test_phase_classifier_matches_scaled_template(tmp_path):
+    classifier, _ = _classifier(tmp_path)
+    image = np.zeros((50, 100, 3), dtype=np.uint8)
+    scaled = cv2.resize(_pattern("prep"), (25, 25), interpolation=cv2.INTER_LINEAR)
+    image[12:37, 12:37] = scaled
+    raw = classifier.observe(image)
+    assert raw.phase == GamePhase.PREPARATION
+    prep_signal = next(signal for signal in raw.signals if signal.name == "prep")
+    assert prep_signal.best_scale in {1.125, 1.25}
+
+
 def test_phase_classifier_returns_unknown_when_both_signals_present(tmp_path):
     classifier, _ = _classifier(tmp_path)
     raw = classifier.observe(_viewport(prep=True, combat=True))
@@ -69,7 +80,6 @@ def test_phase_state_machine_requires_confirming_frames(tmp_path):
     first = machine.update(raw)
     assert first.stable_phase == GamePhase.UNKNOWN
     second = machine.update(raw)
-    # high-confidence observations use strong_confirm_frames=2
     assert second.stable_phase == GamePhase.PREPARATION
     assert second.changed is True
 
