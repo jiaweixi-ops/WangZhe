@@ -10,19 +10,20 @@ from .models import GateResult
 
 SPIKE_THRESHOLDS = {
     "s0": {
+        "pass_min_new_present_frames": 5,
         "pass_max_black_rate": 0.001,
         "pass_max_stale_rate": 0.01,
-        "pass_max_none_grab_rate": 0.05,
-        "pass_max_gap_rate": 0.05,
+        "pass_max_capture_error_rate": 0.01,
         "degraded_max_black_rate": 0.01,
         "degraded_max_stale_rate": 0.10,
-        "degraded_max_none_grab_rate": 0.20,
-        "degraded_max_gap_rate": 0.20,
+        "degraded_max_capture_error_rate": 0.05,
     },
     "s1": {
-        "max_overlay_signal_mean": 4.0,
-        "max_overlay_signal_p95": 18.0,
-        "max_hidden_baseline_mean": 6.0,
+        "min_positive_control_signal_mean": 6.0,
+        "min_positive_control_signal_p95": 24.0,
+        "max_excluded_signal_mean": 4.0,
+        "max_excluded_signal_p95": 18.0,
+        "min_signal_reduction_mean": 4.0,
     },
     "s2": {
         "pass_min_accepted_rate": 0.95,
@@ -38,34 +39,55 @@ def _rate(n: int, d: int) -> float:
     return n / d if d else 0.0
 
 
-def assess_s0(*, health_rows: list[dict], none_grabs: int, gap_count: int) -> dict:
-    total_attempts = len(health_rows) + none_grabs
+def assess_s0(
+    *,
+    health_rows: list[dict],
+    no_new_presents: int,
+    capture_errors: int,
+    gap_count: int,
+) -> dict:
+    """Assess S0 without treating event-driven DXGI idleness as failure.
+
+    DXcam returns None when there is no newly presented desktop frame. That is
+    recorded as liveness evidence but is not a capture error. Likewise, long
+    intervals between new presents are informational until a stage-aware witness
+    says the game *should* be changing.
+    """
     captured = len(health_rows)
+    poll_attempts = captured + no_new_presents
+    total_operations = poll_attempts + capture_errors
     counts = Counter(row["freshness"] for row in health_rows)
     metrics = {
-        "captured_frames": captured,
-        "capture_attempts": total_attempts,
-        "none_grab_rate": _rate(none_grabs, total_attempts),
+        "captured_new_present_frames": captured,
+        "poll_attempts": poll_attempts,
+        "no_new_present_count": no_new_presents,
+        "no_new_present_rate": _rate(no_new_presents, poll_attempts),
+        "capture_error_count": capture_errors,
+        "capture_error_rate": _rate(capture_errors, total_operations),
         "black_rate": _rate(counts.get("BLACK", 0), captured),
         "stale_rate": _rate(counts.get("STALE_SUSPECT", 0), captured),
-        "gap_rate": _rate(gap_count, max(captured - 1, 1)),
+        "new_present_gap_count": gap_count,
+        "new_present_gap_rate": _rate(gap_count, max(captured - 1, 1)),
         "freshness_counts": dict(counts),
+        "note": (
+            "no_new_present_rate and new_present_gap_rate are informational; "
+            "they are not failures without an independent activity expectation"
+        ),
     }
     t = SPIKE_THRESHOLDS["s0"]
     if captured == 0:
         result = GateResult.FAIL
     elif (
-        metrics["black_rate"] <= t["pass_max_black_rate"]
+        captured >= t["pass_min_new_present_frames"]
+        and metrics["black_rate"] <= t["pass_max_black_rate"]
         and metrics["stale_rate"] <= t["pass_max_stale_rate"]
-        and metrics["none_grab_rate"] <= t["pass_max_none_grab_rate"]
-        and metrics["gap_rate"] <= t["pass_max_gap_rate"]
+        and metrics["capture_error_rate"] <= t["pass_max_capture_error_rate"]
     ):
         result = GateResult.PASS
     elif (
         metrics["black_rate"] <= t["degraded_max_black_rate"]
         and metrics["stale_rate"] <= t["degraded_max_stale_rate"]
-        and metrics["none_grab_rate"] <= t["degraded_max_none_grab_rate"]
-        and metrics["gap_rate"] <= t["degraded_max_gap_rate"]
+        and metrics["capture_error_rate"] <= t["degraded_max_capture_error_rate"]
     ):
         result = GateResult.DEGRADED_SHIPPABLE
     else:
@@ -80,26 +102,53 @@ def assess_s1(probe: dict | None, *, external_overlay_available: bool) -> dict:
             "reason": "inside-overlay contamination probe not run",
             "thresholds": SPIKE_THRESHOLDS["s1"],
         }
+
     t = SPIKE_THRESHOLDS["s1"]
     metrics = probe.get("metrics", {})
     conclusive = bool(probe.get("conclusive"))
-    clean = (
-        conclusive
-        and metrics.get("overlay_signal_mean", float("inf")) <= t["max_overlay_signal_mean"]
-        and metrics.get("overlay_signal_p95", float("inf")) <= t["max_overlay_signal_p95"]
-        and metrics.get("hidden_baseline_mean", float("inf")) <= t["max_hidden_baseline_mean"]
+    positive_control = (
+        metrics.get("positive_control_signal_mean", -1.0)
+        >= t["min_positive_control_signal_mean"]
+        or metrics.get("positive_control_signal_p95", -1.0)
+        >= t["min_positive_control_signal_p95"]
+    )
+    excluded_clean = (
+        metrics.get("excluded_signal_mean", float("inf"))
+        <= t["max_excluded_signal_mean"]
+        and metrics.get("excluded_signal_p95", float("inf"))
+        <= t["max_excluded_signal_p95"]
+        and metrics.get("signal_reduction_mean", -1.0)
+        >= t["min_signal_reduction_mean"]
     )
     affinity_ok = bool((probe.get("capture_exclusion") or {}).get("success"))
-    if clean and affinity_ok:
+    exclusion_verified = bool(probe.get("exclusion_verified"))
+
+    if conclusive and positive_control and exclusion_verified and affinity_ok and excluded_clean:
         result = GateResult.PASS
-        reason = "inside overlay excluded from capture under a stable background"
+        reason = (
+            "positive control proved overlay visibility with WDA_NONE, then "
+            "WDA_EXCLUDEFROMCAPTURE removed the measured signal"
+        )
     elif external_overlay_available:
         result = GateResult.DEGRADED_SHIPPABLE
-        reason = "inside overlay not proven clean; external panel remains a shippable fallback"
+        if not conclusive:
+            reason = "S1 measurement was inconclusive; external panel remains the safe fallback"
+        elif not positive_control:
+            reason = "positive control did not prove overlay detectability; negative result cannot be trusted"
+        else:
+            reason = "inside overlay exclusion not cleanly verified; external panel remains the safe fallback"
     else:
         result = GateResult.FAIL
-        reason = "overlay contamination unresolved and no external fallback available"
-    return {"result": result.value, "reason": reason, "metrics": metrics, "thresholds": t}
+        reason = "inside overlay unresolved and no external fallback available"
+
+    return {
+        "result": result.value,
+        "reason": reason,
+        "metrics": metrics,
+        "positive_control_passed": positive_control,
+        "exclusion_verified": exclusion_verified,
+        "thresholds": t,
+    }
 
 
 def summarize_registration(rows: list[dict]) -> dict:
