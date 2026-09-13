@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qijing-spike"
+version = "0.1.0"
+description = "Qijing AI Coach risk-validation spike"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy>=1.26",
+  "opencv-python>=4.10",
+  "psutil>=6.0",
+  "pywin32>=306; sys_platform == 'win32'",
+  "dxcam>=0.0.5; sys_platform == 'win32'",
+  "PySide6>=6.8; sys_platform == 'win32'",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3"]
+
+[project.scripts]
+qijing-inspect = "qijing_spike.inspect_runtime:main"
+qijing-spike = "qijing_spike.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
