@@ -2,6 +2,27 @@
 
 每项输出：`PASS / DEGRADED_SHIPPABLE / FAIL / NOT_RUN`。
 
+## Spike 退出 / 继续条件
+
+当前版本在 S3/S4 尚未提供独立 liveness witness 前，S0 的完整 `PASS` 在构造上不可达。这不是阻塞后续工作的理由。
+
+允许进入 S3/S4 的条件是：
+
+```text
+S0 = DEGRADED_SHIPPABLE
+且唯一未闭合项是 stale/freeze 无 witness
+且 capture/black/sample-density 没有 FAIL
+且 S1/S2 没有 FAIL
+```
+
+也就是说：
+
+> **S0=DEGRADED_SHIPPABLE（仅因 NO_WITNESS_DEFERRED_TO_S3_S4）视为当前 Spike 阶段可继续。**
+
+S3/S4 接入阶段/倒计时 activity witness 后，再重新签发 S0 的完整 PASS/FAIL。
+
+---
+
 ## S0 捕获
 
 阈值真值见 `qijing_spike.gates.SPIKE_THRESHOLDS["s0"]`。
@@ -51,6 +72,8 @@ new_present_frames_per_minute
 
 并输出 `sample_sufficiency`。该值代表实验是否拿到足够多的新呈现样本，不代表合法静止场景必须达到某个动画帧率。
 
+---
+
 ## S1 Overlay
 
 S1 的原则是：
@@ -61,28 +84,44 @@ S1 的原则是：
 
 > 游戏自身运动不能被直接当成 Overlay 污染。
 
-因此 PASS 必须运行 `--probe-overlay-exclusion`，并执行**正对照 + 空间对照**：
+因此 PASS 必须运行 `--probe-overlay-exclusion`，并执行**正对照 + 空间对照 + affinity 差分**：
 
 1. Overlay 隐藏，取得一个非缓存 baseline `F0`；
 2. Probe 切换成产品近似几何的小型透明 marker，而不是 260×120 面板；
 3. 显示 marker 到 viewport 内；
 4. 显式设置 `WDA_NONE`；
 5. 取得新的桌面呈现 `F+`；
-6. 在 marker 重叠区域旁选择一个或多个**同尺寸控制块**；
-7. 正对照信号定义为：
-
-```text
-marker 区变化 - 同尺寸控制块变化
-```
-
-8. 空间归一化后的正对照必须超过阈值；
+6. 在 marker 重叠区域旁选择一个或多个同尺寸控制块；
+7. 对 `F+` 计算空间归一化 marker signal；
+8. 正对照必须超过阈值，证明 marker 本身可被测量；
 9. 设置 `WDA_EXCLUDEFROMCAPTURE`；
 10. 取得新的桌面呈现 `F−`；
 11. 对 `F−` 做同样空间归一化；
-12. marker-specific 信号必须下降到阈值内，并达到最小 signal reduction；
-13. 同时记录两次 `SetWindowDisplayAffinity` 返回值和 last-error。
+12. 判词只依据 **`F+ → F−` 的 marker-signal reduction**；
+13. `F−` 的绝对残留只保留作诊断证据，不能单独证明 exclusion 失败；
+14. 同时记录两次 `SetWindowDisplayAffinity` 返回值和 last-error。
 
 使用多个可用同尺寸控制块时，控制运动取中位值，以减少单一局部动画对结论的影响。
+
+### 为什么不用 F− 的绝对残留判失败
+
+marker 所在棋盘区域可能发生局部动画，而邻近控制块完全静止。此时即使 exclusion 已正确移除 marker：
+
+```text
+F− vs F0
+```
+
+仍可能有很大的绝对残留。
+
+因此：
+
+```text
+excluded_signal 大
+!=
+exclusion 失败
+```
+
+只有在正对照成立后，**开启 affinity 没有产生足够的 marker-signal reduction**，才允许输出 `PROVEN_NOT_WORKING`。
 
 ### S1 正交结果字段
 
@@ -97,8 +136,8 @@ exclusion_outcome:
 
 含义：
 
-- `PROVEN_WORKING`：正对照成立，排除后 marker-specific 信号被移除；
-- `PROVEN_NOT_WORKING`：正对照成立，但 affinity 失败或排除后信号仍存在；
+- `PROVEN_WORKING`：正对照成立，开启 exclusion 后 marker-signal reduction 达到阈值；
+- `PROVEN_NOT_WORKING`：正对照成立，但 affinity API 失败，或 affinity 切换没有产生足够差分；
 - `UNMEASURED`：没有拿到新帧、缓存帧、正对照不成立、没有控制块等，无法证明正/负。
 
 这样“已证明失败”和“本次没测到”即使都因外置面板 fallback 得到 `DEGRADED_SHIPPABLE`，证据语义仍然不同。
@@ -111,11 +150,17 @@ exclusion_outcome:
 - viewport 内无法放置同尺寸控制块；
 - 开启排除后拿不到新的阴性测量帧；
 - affinity API 失败；
-- 排除后的 marker-specific 信号仍超过阈值。
+- affinity 切换后的 marker-signal reduction 低于阈值。
+
+注意：
+
+> **排除后仍存在较大的绝对游戏运动，不再是失败条件。**
 
 如果游戏内 Overlay 无法证明干净，但外置面板可用：`DEGRADED_SHIPPABLE`。
 
 Probe 自身的 sleep、affinity 切换和 compositor 更新不计入 S0 gap/freshness 基线，也从 S0 sample-density 观察时长中扣除。
+
+---
 
 ## S2 Registration
 
