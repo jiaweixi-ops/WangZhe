@@ -12,6 +12,7 @@ if sys.platform == "win32":
     from PySide6 import QtCore, QtGui, QtWidgets
 
 
+WDA_NONE = 0x00000000
 WDA_EXCLUDEFROMCAPTURE = 0x00000011
 GWL_EXSTYLE = -20
 WS_EX_TRANSPARENT = 0x00000020
@@ -22,18 +23,26 @@ SWP_NOSIZE = 0x0001
 SWP_NOACTIVATE = 0x0010
 
 
-def set_capture_exclusion(hwnd: int) -> dict:
+def set_capture_affinity(hwnd: int, affinity: int) -> dict:
     if sys.platform != "win32":
-        return {"success": False, "last_error": None, "reason": "not Windows"}
+        return {"success": False, "last_error": None, "reason": "not Windows", "affinity": affinity}
     user32 = ctypes.WinDLL("user32", use_last_error=True)
     ctypes.set_last_error(0)
-    ok = bool(user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE))
+    ok = bool(user32.SetWindowDisplayAffinity(hwnd, int(affinity)))
     error = ctypes.get_last_error()
     return {
         "success": ok,
         "last_error": int(error),
-        "affinity": WDA_EXCLUDEFROMCAPTURE,
+        "affinity": int(affinity),
     }
+
+
+def set_capture_exclusion(hwnd: int) -> dict:
+    return set_capture_affinity(hwnd, WDA_EXCLUDEFROMCAPTURE)
+
+
+def clear_capture_exclusion(hwnd: int) -> dict:
+    return set_capture_affinity(hwnd, WDA_NONE)
 
 
 def set_click_through(hwnd: int) -> dict:
@@ -86,6 +95,7 @@ if sys.platform == "win32":
             self._text = "棋镜 Spike\nTEST PLAN"
             self.capture_exclusion_result: dict | None = None
             self.click_through_result: dict | None = None
+            self.capture_affinity_history: list[dict] = []
 
         @property
         def hwnd(self) -> int:
@@ -100,14 +110,24 @@ if sys.platform == "win32":
             self._text = text
             self.update()
 
+        def set_capture_excluded(self, excluded: bool) -> dict:
+            result = (
+                set_capture_exclusion(self.hwnd)
+                if excluded
+                else clear_capture_exclusion(self.hwnd)
+            )
+            result = {**result, "excluded": bool(excluded)}
+            self.capture_affinity_history.append(result)
+            if excluded:
+                self.capture_exclusion_result = result
+            return result
+
         def anchor_outside(
             self,
             game_client: Rect,
             monitor: MonitorInfo | None,
             gap: int = 8,
         ) -> None:
-            # All coordinates here are Win32 physical pixels. Qt logical geometry is
-            # intentionally not mixed into placement.
             own = self.physical_rect()
             width, height = own.width, own.height
             work = monitor.work_rect if monitor is not None else game_client
@@ -135,7 +155,7 @@ if sys.platform == "win32":
         def showEvent(self, event) -> None:
             super().showEvent(event)
             self.click_through_result = set_click_through(self.hwnd)
-            self.capture_exclusion_result = set_capture_exclusion(self.hwnd)
+            self.set_capture_excluded(True)
 
         def paintEvent(self, event) -> None:
             painter = QtGui.QPainter(self)

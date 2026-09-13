@@ -10,13 +10,16 @@ from .models import CapturedFrame, FrameFreshness, FrameHealth
 
 
 class FrameHealthMonitor:
-    """Detect black/frozen capture without relying on a whole-frame perceptual hash.
+    """Measure local visual activity without inventing liveness expectations.
 
     The monitor downsamples the frame, splits it into tiles and measures local
-    absolute differences. Small UI changes (timer/resource digits) can therefore
-    count as activity even when most of the frame is static. A stale conclusion
-    is only made after the stream has demonstrated recent activity, or when a
-    future stage-aware caller explicitly supplies ``activity_expected=True``.
+    absolute differences. It can report BLACK/FRESH/QUIET from the pixels alone.
+    STALE_SUSPECT is emitted only when an independent caller explicitly provides
+    `activity_expected=True` (for example a future stage/timer liveness witness).
+
+    Recent activity is still learned and recorded as evidence, but it is not used
+    as proof that the scene must keep changing: a legal menu/loading/static phase
+    may follow an animated phase for arbitrarily long.
     """
 
     def __init__(
@@ -153,19 +156,18 @@ class FrameHealthMonitor:
         if self._last_change_ns is not None:
             seconds_since_change = max(0.0, (now_ns - self._last_change_ns) / 1e9)
 
-        expected = learned_dynamic if activity_expected is None else activity_expected
         if meaningful_change:
             freshness = FrameFreshness.FRESH
             reason = f"local activity in {changed_tiles} tile(s)"
-        elif expected and seconds_since_change is not None and seconds_since_change >= self.stale_after_seconds:
+        elif activity_expected is True and seconds_since_change is not None and seconds_since_change >= self.stale_after_seconds:
             freshness = FrameFreshness.STALE_SUSPECT
             reason = (
                 f"no meaningful local change for {seconds_since_change:.2f}s "
-                "after activity was expected"
+                "while an independent liveness witness expected activity"
             )
         else:
             freshness = FrameFreshness.QUIET
-            reason = "no meaningful local change; insufficient evidence for stale capture"
+            reason = "no meaningful local change; no independent stale evidence"
 
         return FrameHealth(
             freshness=freshness,

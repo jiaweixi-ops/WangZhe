@@ -43,24 +43,41 @@ def test_static_scene_does_not_become_stale_without_activity_baseline():
     assert not health.learned_dynamic
 
 
-def test_dynamic_stream_then_freeze_becomes_stale():
+def _learn_dynamic_stream(monitor, base):
+    monitor.observe(frame(base, 1, 0.0))
+    f1 = base.copy()
+    f1[20:35, 40:55] = 180
+    monitor.observe(frame(f1, 2, 1.0))
+    f2 = base.copy()
+    f2[20:35, 55:70] = 180
+    active = monitor.observe(frame(f2, 3, 2.0))
+    assert active.learned_dynamic
+    return f2
+
+
+def test_dynamic_then_legally_static_stays_quiet_without_witness():
     monitor = FrameHealthMonitor(
         min_activity_events=2,
         learning_window_seconds=10.0,
         stale_after_seconds=2.0,
     )
     base = np.full((216, 384, 3), 90, dtype=np.uint8)
-    monitor.observe(frame(base, 1, 0.0))
+    final = _learn_dynamic_stream(monitor, base)
 
-    f1 = base.copy()
-    f1[20:35, 40:55] = 180
-    monitor.observe(frame(f1, 2, 1.0))
+    health = monitor.observe(frame(final, 4, 7.0))
+    assert health.freshness == FrameFreshness.QUIET
+    assert health.seconds_since_meaningful_change >= 2.0
 
-    f2 = base.copy()
-    f2[20:35, 55:70] = 180
-    active = monitor.observe(frame(f2, 3, 2.0))
-    assert active.learned_dynamic
 
-    health = monitor.observe(frame(f2, 4, 4.5))
+def test_independent_activity_expectation_can_mark_stale():
+    monitor = FrameHealthMonitor(
+        min_activity_events=2,
+        learning_window_seconds=10.0,
+        stale_after_seconds=2.0,
+    )
+    base = np.full((216, 384, 3), 90, dtype=np.uint8)
+    final = _learn_dynamic_stream(monitor, base)
+
+    health = monitor.observe(frame(final, 4, 4.5), activity_expected=True)
     assert health.freshness == FrameFreshness.STALE_SUSPECT
     assert health.seconds_since_meaningful_change >= 2.0
