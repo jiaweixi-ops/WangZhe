@@ -74,6 +74,7 @@ def _run_loop(args, overlay=None, qt_app=None) -> dict:
     viewport_rows: list[dict] = []
     registration_rows: list[dict] = []
     no_new_present_events: list[dict] = []
+    window_unavailable_events: list[dict] = []
     capture_errors: list[dict] = []
     capture_gaps: list[dict] = []
     hwnd_events: list[dict] = []
@@ -83,11 +84,11 @@ def _run_loop(args, overlay=None, qt_app=None) -> dict:
     overlay_probe_done = False
     last_capture_timestamp_ns: int | None = None
     last_anchor_key = None
+    s0_paused_seconds = 0.0
 
     if overlay is not None:
         overlay.set_text("棋镜 Spike\nS-1/S0/S1/S2")
         if args.probe_overlay_exclusion:
-            # The first normal capture becomes a known-clean baseline frame.
             overlay.hide()
             qt_app.processEvents()
 
@@ -113,10 +114,12 @@ def _run_loop(args, overlay=None, qt_app=None) -> dict:
                 )
 
             if window.minimized or window.monitor is None:
-                capture_errors.append(
+                window_unavailable_events.append(
                     {
                         "timestamp_ns": time.perf_counter_ns(),
-                        "error": "window minimized or monitor unresolved",
+                        "reason": (
+                            "window minimized" if window.minimized else "monitor unresolved"
+                        ),
                     }
                 )
                 continue
@@ -129,8 +132,6 @@ def _run_loop(args, overlay=None, qt_app=None) -> dict:
                 )
                 continue
             if frame is None:
-                # DXcam's one-shot semantics: None means no newly presented desktop
-                # frame, not a capture failure.
                 no_new_present_events.append(
                     {
                         "timestamp_ns": time.perf_counter_ns(),
@@ -146,12 +147,18 @@ def _run_loop(args, overlay=None, qt_app=None) -> dict:
                         {
                             "timestamp_ns": frame.capture_timestamp_ns,
                             "gap_seconds": gap_seconds,
-                            "note": "informational new-present gap; not a failure without activity expectation",
+                            "note": (
+                                "informational new-present gap; not a failure without "
+                                "an independent activity expectation"
+                            ),
                         }
                     )
             last_capture_timestamp_ns = frame.capture_timestamp_ns
 
-            health = health_monitor.observe(frame)
+            # S3/S4 do not exist yet, so there is intentionally no independent
+            # activity witness. Record that fact instead of manufacturing a stale=0 KPI.
+            activity_expected = None
+            health = health_monitor.observe(frame, activity_expected=activity_expected)
             health_rows.append(
                 {
                     "frame_id": frame.frame_id,
@@ -160,6 +167,7 @@ def _run_loop(args, overlay=None, qt_app=None) -> dict:
                     "monitor_index": frame.monitor_index,
                     "clipped": frame.clipped,
                     "reused_cached": frame.reused_cached,
+                    "activity_expected": activity_expected,
                     **health.to_dict(),
                 }
             )
@@ -192,6 +200,7 @@ def _run_loop(args, overlay=None, qt_app=None) -> dict:
 
             if overlay is not None and qt_app is not None:
                 if args.probe_overlay_exclusion and not overlay_probe_done:
+                    probe_started = time.monotonic()
                     overlay_probe_result = probe_overlay_exclusion(
                         backend=backend,
                         window=window,
@@ -200,10 +209,8 @@ def _run_loop(args, overlay=None, qt_app=None) -> dict:
                         viewport_screen=viewport_screen,
                         baseline_frame=frame,
                     )
+                    s0_paused_seconds += max(0.0, time.monotonic() - probe_started)
                     overlay_probe_done = True
-                    # Probe sleeps/toggles the compositor by design. Do not charge
-                    # its wall time to S0 gap metrics or carry its visual state into
-                    # the main freshness baseline.
                     last_capture_timestamp_ns = None
                     health_monitor.reset()
                     next_tick = time.monotonic() + interval
@@ -228,17 +235,22 @@ def _run_loop(args, overlay=None, qt_app=None) -> dict:
                     {
                         "frame_id": frame.frame_id,
                         "timestamp_ns": frame.capture_timestamp_ns,
+                        "viewport_mode": viewport_result.mode,
+                        "viewport_rect": viewport_result.rect.as_region(),
                         **registrar.estimate(reference, viewport_image).to_dict(),
                     }
                 )
     finally:
         backend.close()
 
+    s0_observed_seconds = max(0.1, float(args.duration) - s0_paused_seconds)
     s0 = assess_s0(
         health_rows=health_rows,
         no_new_presents=len(no_new_present_events),
         capture_errors=len(capture_errors),
+        window_unavailable=len(window_unavailable_events),
         gap_count=len(capture_gaps),
+        observed_seconds=s0_observed_seconds,
     )
     s1 = assess_s1(
         overlay_probe_result,
@@ -253,9 +265,12 @@ def _run_loop(args, overlay=None, qt_app=None) -> dict:
         "hwnd_events": hwnd_events,
         "capture_backend": backend.describe(),
         "duration_seconds": args.duration,
+        "s0_observed_seconds": s0_observed_seconds,
+        "s0_paused_seconds": s0_paused_seconds,
         "target_fps": args.fps,
         "captured_new_present_frames": len(health_rows),
         "no_new_present_count": len(no_new_present_events),
+        "window_unavailable_count": len(window_unavailable_events),
         "capture_errors": capture_errors,
         "capture_gap_count": len(capture_gaps),
         "overlay": {
@@ -276,6 +291,7 @@ def _run_loop(args, overlay=None, qt_app=None) -> dict:
         "viewport.json": viewport_rows,
         "registration.json": registration_rows,
         "no_new_presents.json": no_new_present_events,
+        "window_unavailable.json": window_unavailable_events,
         "capture_gaps.json": capture_gaps,
         "evidence.json": evidence,
     }
