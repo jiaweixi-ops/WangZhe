@@ -24,4 +24,4 @@ jobs:
         run: pytest
       - name: Windows risk-module import smoke test
         if: runner.os == 'Windows'
-        run: python -c "import qijing_spike.capture, qijing_spike.overlay, qijing_spike.registration, qijing_spike.window; print('windows imports ok')"
+        run: python -c "import qijing_spike.capture, qijing_spike.overlay, qijing_spike.registration, qijing_spike.window, qijing_spike.phase, qijing_spike.timer, qijing_spike.stage_profile; print('windows imports ok')"
