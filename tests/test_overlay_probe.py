@@ -40,8 +40,9 @@ class StubOverlay:
         self.capture_exclusion_result = None
         self.click_through_result = {"success": True}
         self.capture_affinity_history = []
-        self._rect = Rect(10, 10, 50, 50)
+        self._rect = Rect(10, 10, 30, 30)
         self.visible = False
+        self.probe_mode = False
 
     def hide(self):
         self.visible = False
@@ -54,6 +55,9 @@ class StubOverlay:
 
     def physical_rect(self):
         return self._rect
+
+    def set_probe_marker_mode(self, enabled):
+        self.probe_mode = bool(enabled)
 
     def set_capture_excluded(self, excluded):
         result = {
@@ -89,11 +93,19 @@ def window():
     )
 
 
-def images():
+def images(*, moving=False):
     baseline = np.full((100, 100, 3), 100, dtype=np.uint8)
-    contaminated = baseline.copy()
-    contaminated[10:50, 10:50] = 140
-    return baseline, contaminated
+
+    # The target is 10:30,10:30. The first same-size control block selected by
+    # the probe is 10:30,42:62 (screen x=42:62, y=10:30).
+    motion = baseline.copy()
+    if moving:
+        motion[10:30, 10:30] = 125
+        motion[10:30, 42:62] = 125
+
+    contaminated = motion.copy()
+    contaminated[10:30, 10:30] = 180
+    return baseline, motion, contaminated
 
 
 def run_probe(frames, baseline):
@@ -110,7 +122,7 @@ def run_probe(frames, baseline):
 
 
 def test_positive_control_then_exclusion_can_pass():
-    baseline, contaminated = images()
+    baseline, _, contaminated = images()
     probe = run_probe(
         [make_frame(contaminated, 1), make_frame(baseline, 2)],
         baseline,
@@ -118,35 +130,55 @@ def test_positive_control_then_exclusion_can_pass():
     gate = assess_s1(probe, external_overlay_available=True)
     assert probe["conclusive"] is True
     assert gate["positive_control_passed"] is True
+    assert gate["exclusion_outcome"] == "PROVEN_WORKING"
     assert gate["result"] == "PASS"
 
 
-def test_visible_overlay_after_exclusion_degrades():
-    baseline, contaminated = images()
+def test_equal_game_motion_under_target_and_control_is_normalized_out():
+    baseline, motion, contaminated = images(moving=True)
     probe = run_probe(
-        [make_frame(contaminated, 1), make_frame(contaminated, 2)],
+        [make_frame(contaminated, 1), make_frame(motion, 2)],
         baseline,
     )
     gate = assess_s1(probe, external_overlay_available=True)
     assert gate["positive_control_passed"] is True
+    assert probe["metrics"]["positive_control_motion_mean"] > 0
+    assert probe["metrics"]["excluded_target_mean"] > 0
+    assert probe["metrics"]["excluded_signal_mean"] == 0.0
+    assert gate["exclusion_outcome"] == "PROVEN_WORKING"
+    assert gate["result"] == "PASS"
+
+
+def test_visible_marker_after_exclusion_is_proven_not_working():
+    baseline, motion, contaminated = images(moving=True)
+    contaminated_after_exclusion = contaminated.copy()
+    probe = run_probe(
+        [make_frame(contaminated, 1), make_frame(contaminated_after_exclusion, 2)],
+        baseline,
+    )
+    gate = assess_s1(probe, external_overlay_available=True)
+    assert gate["positive_control_passed"] is True
+    assert gate["exclusion_outcome"] == "PROVEN_NOT_WORKING"
     assert gate["result"] == "DEGRADED_SHIPPABLE"
 
 
 def test_cached_frames_cannot_prove_exclusion():
-    baseline, contaminated = images()
+    baseline, _, contaminated = images()
     cached = make_frame(contaminated, 1, cached=True)
     probe = run_probe([cached], baseline)
     gate = assess_s1(probe, external_overlay_available=True)
     assert probe["conclusive"] is False
+    assert gate["exclusion_outcome"] == "UNMEASURED"
     assert gate["result"] == "DEGRADED_SHIPPABLE"
 
 
 def test_missing_positive_control_cannot_pass():
-    baseline, _ = images()
+    baseline, motion, _ = images(moving=True)
     probe = run_probe(
-        [make_frame(baseline, 1), make_frame(baseline, 2)],
+        [make_frame(motion, 1), make_frame(motion, 2)],
         baseline,
     )
     gate = assess_s1(probe, external_overlay_available=True)
     assert gate["positive_control_passed"] is False
+    assert gate["exclusion_outcome"] == "UNMEASURED"
     assert gate["result"] == "DEGRADED_SHIPPABLE"
